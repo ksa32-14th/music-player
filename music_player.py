@@ -10,6 +10,7 @@ import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")  # 콘솔 없는 exe에서 안내 문구 출력 방지
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ import customtkinter as ctk
 import pygame
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
 import tag_fixer as tf
 
@@ -109,27 +110,86 @@ def download_and_extract(url, progress=None):
     raise FileNotFoundError(f"업데이트 파일에 {EXE_NAME}가 없습니다.")
 
 
-UPDATER_PS1 = r"""param([int]$AppPid, [string]$Src, [string]$Dst, [string]$Exe)
-Wait-Process -Id $AppPid -Timeout 60 -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-robocopy $Src $Dst /E /R:10 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -lt 8) { Remove-Item -LiteralPath (Split-Path $Src -Parent) -Recurse -Force -ErrorAction SilentlyContinue }
-Start-Process -FilePath $Exe
-"""
+UPDATE_LOG = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer" / "update.log"
+
+
+def ulog(msg):
+    try:
+        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(UPDATE_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    except OSError:
+        pass
 
 
 def launch_updater(new_dir):
-    """프로그램이 종료되기를 기다렸다가 새 파일을 복사하고 다시 실행하는 PowerShell을 띄운다."""
+    """임시 폴더에 풀어 둔 새 버전 exe를 '설치 모드'로 실행한다.
+    새 exe가 이 프로그램이 끝나기를 기다렸다가 자기 파일을 설치 폴더에 복사하고 다시 실행한다."""
     install_dir = Path(sys.executable).resolve().parent
-    script = Path(tempfile.gettempdir()) / "mmp_updater.ps1"
-    script.write_text(UPDATER_PS1, encoding="utf-8-sig")
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-         "-File", str(script), "-AppPid", str(os.getpid()), "-Src", str(new_dir),
-         "-Dst", str(install_dir), "-Exe", str(install_dir / EXE_NAME)],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
-        close_fds=True,
-    )
+    new_exe = Path(new_dir) / EXE_NAME
+    ulog(f"launch helper: {new_exe} -> {install_dir} (pid {os.getpid()})")
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([str(new_exe), "--apply-update", str(install_dir), str(os.getpid())],
+                     cwd=str(new_dir), creationflags=flags, close_fds=True)
+
+
+def _wait_for_exit(pid, timeout=60):
+    if os.name != "nt":
+        return
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        k32.WaitForSingleObject(handle, int(timeout * 1000))
+        k32.CloseHandle(handle)
+
+
+def run_update_helper(install_dir, old_pid):
+    """설치 모드: 기존 프로그램 종료를 기다린 뒤 새 파일을 복사하고 설치된 exe를 실행한다."""
+    src = Path(sys.executable).resolve().parent
+    dst = Path(install_dir)
+    ulog(f"helper start: {src} -> {dst}")
+    _wait_for_exit(old_pid)
+    time.sleep(0.5)
+    last_error = None
+    for attempt in range(30):  # 파일이 아직 잠겨 있으면 0.5초 간격으로 재시도
+        try:
+            for item in src.iterdir():
+                target = dst / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+            last_error = None
+            break
+        except OSError as e:
+            last_error = e
+            time.sleep(0.5)
+    if last_error:
+        ulog(f"copy failed: {last_error}")
+        ctypes_msg(f"업데이트 파일을 복사하지 못했습니다.\n{last_error}\n\n"
+                   f"직접 설치하려면 다음 폴더의 내용을 프로그램 폴더에 덮어쓰세요.\n{src}")
+        return
+    ulog("copy ok, relaunch")
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([str(dst / EXE_NAME), "--updated"], cwd=str(dst), creationflags=flags, close_fds=True)
+
+
+def ctypes_msg(text):
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, text, APP_NAME, 0x10)
+
+
+def cleanup_old_updates():
+    """지난 업데이트가 남긴 임시 폴더를 지운다(사용 중이면 건너뜀)."""
+    for d in Path(tempfile.gettempdir()).glob("mmp_update_*"):
+        try:
+            if Path(sys.executable).resolve().is_relative_to(d.resolve()):
+                continue
+        except (OSError, ValueError):
+            pass
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ───────────────────────── 데이터 저장 ─────────────────────────
@@ -280,6 +340,32 @@ def make_icon(kind, size, color):
         w = int(S * 0.06)
         d.arc((S * 0.40, S * 0.32, S * 0.70, S * 0.68), -55, 55, fill=color, width=w)
         d.arc((S * 0.40, S * 0.18, S * 0.88, S * 0.82), -55, 55, fill=color, width=w)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def make_heart(size, color, filled=True, stroke=0.09):
+    """하트 아이콘. filled=False면 테두리만 그린다. 4배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
+    import math
+    S = size * 4
+
+    def heart_mask(scale):
+        pts = []
+        for i in range(240):
+            t = 2 * math.pi * i / 240
+            x = 16 * math.sin(t) ** 3
+            y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+            pts.append((S / 2 + x * S / 36 * scale, S * 0.47 - y * S / 36 * scale))
+        m = Image.new("L", (S, S), 0)
+        ImageDraw.Draw(m).polygon(pts, fill=255)
+        return m
+
+    mask = heart_mask(1.0)
+    if not filled:  # 안쪽을 일정한 두께만큼 깎아 테두리만 남긴다
+        from PIL import ImageChops, ImageFilter
+        k = max(3, int(S * stroke) | 1)
+        mask = ImageChops.subtract(mask, mask.filter(ImageFilter.MinFilter(k)))
+    img = Image.new("RGBA", (S, S), color)
+    img.putalpha(mask)
     return img.resize((size, size), Image.LANCZOS)
 
 
@@ -764,6 +850,10 @@ class MusicApp(ctk.CTk):
         self.ic_prev = ctk_icon("prev", 18, "#2b2b2b", "#e6e6e6")
         self.ic_next = ctk_icon("next", 18, "#2b2b2b", "#e6e6e6")
         self.ic_vol = ctk_icon("volume", 18, "#555555", "#b3b3b3")
+        self.ic_heart_on = ctk.CTkImage(make_heart(40, ACCENT), size=(20, 20))
+        self.ic_heart_off = ctk.CTkImage(light_image=make_heart(40, "#555555", filled=False),
+                                         dark_image=make_heart(40, "#b3b3b3", filled=False), size=(20, 20))
+        self.tree_hearts = {}
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -912,10 +1002,12 @@ class MusicApp(ctk.CTk):
         holder.grid_rowconfigure(0, weight=1)
         holder.grid_columnconfigure(0, weight=1)
 
-        cols = ("fav", "title", "artist", "album", "time")
-        self.tree = ttk.Treeview(holder, columns=cols, show="headings", style="Music.Treeview", selectmode="extended")
-        for c, text in zip(cols, ("", "제목", "아티스트", "앨범", "시간")):
-            self.tree.heading(c, text=text, anchor="e" if c == "time" else ("center" if c == "fav" else "w"))
+        cols = ("title", "artist", "album", "time")
+        self.tree = ttk.Treeview(holder, columns=cols, show=("tree", "headings"), style="Music.Treeview",
+                                 selectmode="extended")
+        self.tree.heading("#0", text="")
+        for c, text in zip(cols, ("제목", "아티스트", "앨범", "시간")):
+            self.tree.heading(c, text=text, anchor="e" if c == "time" else "w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         sbar = ctk.CTkScrollbar(holder, command=self.tree.yview)
         sbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
@@ -963,9 +1055,9 @@ class MusicApp(ctk.CTk):
         self.bar_artist = ctk.CTkLabel(left, text="", font=self.font(12), anchor="w", width=200,
                                        text_color=("#555555", "#b3b3b3"))
         self.bar_artist.grid(row=1, column=1, padx=(12, 4), sticky="nw")
-        self.fav_btn = ctk.CTkButton(left, text="♡", width=36, height=36, corner_radius=18, font=self.font(20),
+        self.fav_btn = ctk.CTkButton(left, text="", image=self.ic_heart_off, width=36, height=36, corner_radius=18,
                                      fg_color="transparent", hover_color=("#dcdcdc", "#222222"),
-                                     text_color=("#2b2b2b", "#e6e6e6"), command=self.toggle_current_fav)
+                                     command=self.toggle_current_fav)
         self.fav_btn.grid(row=0, column=2, rowspan=2)
 
         center = ctk.CTkFrame(bar, fg_color="transparent")
@@ -1017,12 +1109,25 @@ class MusicApp(ctk.CTk):
         style.map("Music.Treeview", background=[("selected", sel)], foreground=[("selected", fg)])
         style.map("Music.Treeview.Heading", background=[("active", bg)], foreground=[("active", fg)])
         style.layout("Music.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        widths = {"fav": 44, "title": 300, "artist": 200, "album": 200, "time": 64}
+        # 하트 칸: 펼침 화살표 자리를 없애고 이미지만 가운데에 둔다
+        style.layout("Music.Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+            ("Treeitem.image", {"side": "left", "sticky": ""}),
+            ("Treeitem.text", {"side": "left", "sticky": ""})]})])
+        style.configure("Music.Treeview", indent=0)
+        hs = max(14, int(18 * scale))
+        style.configure("Music.Treeview.Item", padding=(max(0, (int(44 * scale) - hs) // 2), 0, 0, 0))
+        self.tree_hearts = {
+            True: ImageTk.PhotoImage(make_heart(hs, ACCENT), master=self),
+            False: ImageTk.PhotoImage(make_heart(hs, "#6f6f6f" if dark else "#a0a0a0", filled=False), master=self),
+        }
+        self.tree.column("#0", width=int(44 * scale), minwidth=int(44 * scale), stretch=False, anchor="center")
+        widths = {"title": 300, "artist": 200, "album": 200, "time": 64}
         for c, w in widths.items():
             self.tree.column(c, width=int(w * scale), minwidth=int(min(w, 60) * scale),
-                             stretch=c not in ("fav", "time"),
-                             anchor="e" if c == "time" else ("center" if c == "fav" else "w"))
+                             stretch=c != "time", anchor="e" if c == "time" else "w")
         self.tree.tag_configure("playing", foreground=ACCENT)
+        if self.view_tracks:
+            self.update_fav_cells()
 
     # ───── 스캔 ─────
     def choose_folder(self):
@@ -1115,8 +1220,8 @@ class MusicApp(ctk.CTk):
         cur = self.current["path"] if self.current else None
         for i, t in enumerate(items):
             self.tree.insert("", "end", iid=str(i), tags=("playing",) if t["path"] == cur else (),
-                             values=("♥" if t["path"] in self.favorites else "♡",
-                                     t["title"], t["artist"], t["album"], fmt_time(t["length"])))
+                             image=self.tree_hearts[t["path"] in self.favorites],
+                             values=(t["title"], t["artist"], t["album"], fmt_time(t["length"])))
         names = {"all": "모든 곡", "favorites": "즐겨찾기"}
         self.view_title.configure(text=names.get(self.view) if isinstance(self.view, str) else self.view[1])
         total = len(self.base_tracks())
@@ -1131,18 +1236,18 @@ class MusicApp(ctk.CTk):
     def update_fav_cells(self):
         for iid in self.tree.get_children():
             t = self.view_tracks[int(iid)]
-            self.tree.set(iid, "fav", "♥" if t["path"] in self.favorites else "♡")
+            self.tree.item(iid, image=self.tree_hearts[t["path"] in self.favorites])
 
     # ───── 목록 이벤트 ─────
     def on_double_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
             return
         row = self.tree.identify_row(event.y)
-        if row and self.tree.identify_column(event.x) != "#1":
+        if row and self.tree.identify_column(event.x) != "#0":
             self.play_from_view(int(row))
 
     def on_tree_click(self, event):
-        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_column(event.x) == "#1":
+        if self.tree.identify_region(event.x, event.y) in ("tree", "cell") and self.tree.identify_column(event.x) == "#0":
             row = self.tree.identify_row(event.y)
             if row:
                 self.toggle_fav([self.view_tracks[int(row)]["path"]])
@@ -1196,8 +1301,7 @@ class MusicApp(ctk.CTk):
 
     def update_fav_btn(self):
         on = bool(self.current and self.current["path"] in self.favorites)
-        self.fav_btn.configure(text="♥" if on else "♡",
-                               text_color=ACCENT if on else ("#2b2b2b", "#e6e6e6"))
+        self.fav_btn.configure(image=self.ic_heart_on if on else self.ic_heart_off)
 
     def render_playlists(self):
         for w in self.pl_frame.winfo_children():
@@ -1439,4 +1543,15 @@ class MusicApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--apply-update":
+        try:
+            run_update_helper(sys.argv[2], int(sys.argv[3]))
+        except Exception as e:  # 설치 모드 오류는 기록만 남긴다
+            ulog(f"helper error: {e!r}")
+            ctypes_msg(f"업데이트 중 오류가 발생했습니다.\n{e}")
+        sys.exit(0)
+    if getattr(sys, "frozen", False):
+        t = threading.Timer(15, cleanup_old_updates)  # 업데이트 도우미가 완전히 끝난 뒤 정리
+        t.daemon = True
+        t.start()
     MusicApp().mainloop()
