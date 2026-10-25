@@ -1,0 +1,46 @@
+# music_player.py 또는 requirements.txt가 바뀌어 main 브랜치에 올라오면
+# Windows에서 exe를 빌드해 새 릴리스(v1.0.<실행 번호>)로 올린다.
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "music_player.py"
+      - "requirements.txt"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt
+
+      - name: Write app_info.json
+        shell: pwsh
+        run: |
+          $info = @{ version = "1.0.${{ github.run_number }}"; repo = "${{ github.repository }}" } | ConvertTo-Json -Compress
+          [System.IO.File]::WriteAllText("app_info.json", $info)
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name ModernMusicPlayer --collect-data customtkinter --add-data "app_info.json;." music_player.py
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\ModernMusicPlayer -DestinationPath ModernMusicPlayer.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v1.0.${{ github.run_number }}" ModernMusicPlayer.zip --title "v1.0.${{ github.run_number }}" --notes "Automatic build from ${{ github.sha }}"
