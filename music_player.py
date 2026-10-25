@@ -519,26 +519,26 @@ BACKUP_FILE = DATA_DIR / "tag_backup.json"
 
 
 class TagFixWindow(ctk.CTkToplevel):
-    """곡 정보를 온라인에서 찾아 수정안을 보여 주고, 체크한 항목을 일괄 적용한다."""
+    """라이브러리 안에서 표기 차이·깨진 글자·빈 태그·파일명 형식을 점검해 수정안을 보여 주고,
+    체크한 항목만 일괄 적용한다. 빈 앨범·장르·커버는 원할 때만 온라인에서 찾는다."""
 
     def __init__(self, app, paths, scope):
         super().__init__(app)
         self.app = app
         self.paths = paths
         self.title("태그 정리")
-        self.geometry("1040x700")
-        self.minsize(860, 560)
+        self.geometry("1080x720")
+        self.minsize(880, 580)
         self.transient(app)
         self.font = app.font
 
-        self.suggestions = []  # tf.analyze 결과 중 바꿀 것이 있는 것
-        self.checked = set()   # suggestions 인덱스
-        self._inserted = 0
-        self.phase = "idle"    # idle | analyzing | applying | done
+        self.sugs = []          # tf.analyze_local 결과 전체
+        self.checked = set()    # sugs 인덱스
+        self.phase = "idle"     # idle | local | online | done | applying
         self.stop_flag = threading.Event()
-        self.worker_done = False
-        self.progress = {"done": 0, "total": len(paths), "skipped": 0}
+        self.progress = {"done": 0, "total": 0, "stage": ""}
         self._preview = None
+        self._pool = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -547,12 +547,11 @@ class TagFixWindow(ctk.CTkToplevel):
         head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="태그 정리", font=self.font(22, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
-        eta = max(1, round(len(paths) * 1.4 / 60))
         self.status = ctk.CTkLabel(
             head, anchor="w", justify="left", font=self.font(12), text_color=("#555555", "#a8a8a8"),
-            text=f"대상: {scope} {len(paths)}곡 · 예상 소요 약 {eta}분\n"
-                 "MusicBrainz에서 곡 정보를 찾고 Cover Art Archive에서 커버를 찾습니다. "
-                 "아무것도 바로 바뀌지 않으며, 확인한 뒤 '적용'을 눌러야 파일이 수정됩니다.")
+            text=f"대상: {scope} {len(paths)}곡\n"
+                 "같은 아티스트·앨범이 다르게 저장된 곡, 깨진 글자, 빈 태그, 파일명 형식을 내 라이브러리 안에서 점검합니다. "
+                 "'적용'을 누르기 전에는 아무것도 바뀌지 않습니다.")
         self.status.grid(row=1, column=0, sticky="w", pady=(2, 6))
         self.bar = ctk.CTkProgressBar(head, height=8)
         self.bar.set(0)
@@ -567,22 +566,32 @@ class TagFixWindow(ctk.CTkToplevel):
         self.opt_genre = ctk.BooleanVar(value=True)
         self.opt_cover = ctk.BooleanVar(value=True)
         self.opt_name = ctk.BooleanVar(value=True)
+        self.opt_online = ctk.BooleanVar(value=True)
         for text, var in (("제목·아티스트·앨범", self.opt_info), ("장르", self.opt_genre),
                           ("커버", self.opt_cover), ("파일명", self.opt_name)):
             ctk.CTkCheckBox(opts, text=text, variable=var, font=self.font(12),
-                            command=self.refresh_rows).pack(side="left", padx=(0, 16))
+                            command=self.refresh_rows).pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(opts, text="파일명 형식", font=self.font(12)).pack(side="left", padx=(8, 6))
+        fmt = app.data.get("name_format", "title_artist")
+        self.fmt_labels = {v: k for k, v in tf.NAME_FORMATS.items()}
+        self.fmt_menu = ctk.CTkOptionMenu(opts, values=list(tf.NAME_FORMATS.values()), width=130, height=28,
+                                          font=self.font(12), command=self.on_format)
+        self.fmt_menu.set(tf.NAME_FORMATS.get(fmt, "제목_아티스트"))
+        self.fmt_menu.pack(side="left")
+        self.online_chk = ctk.CTkCheckBox(opts, text="빈 커버·앨범·장르를 온라인에서 찾기",
+                                          variable=self.opt_online, font=self.font(12))
+        self.online_chk.pack(side="left", padx=(18, 0))
 
         mid = ctk.CTkFrame(self, fg_color="transparent")
         mid.grid(row=2, column=0, sticky="nsew", padx=20, pady=4)
         mid.grid_columnconfigure(0, weight=1)
         mid.grid_rowconfigure(0, weight=1)
-        cols = ("chk", "file", "summary", "conf")
+        cols = ("chk", "file", "summary", "why")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", style="Music.Treeview", selectmode="browse")
         for c, text, w, stretch in (("chk", "", 40, False), ("file", "파일", 230, False),
-                                    ("summary", "바뀌는 내용", 620, True), ("conf", "일치도", 70, False)):
-            self.tree.heading(c, text=text, anchor="center" if c in ("chk", "conf") else "w")
-            self.tree.column(c, width=w, minwidth=40, stretch=stretch,
-                             anchor="center" if c in ("chk", "conf") else "w")
+                                    ("summary", "바뀌는 내용", 600, True), ("why", "이유", 130, False)):
+            self.tree.heading(c, text=text, anchor="center" if c == "chk" else "w")
+            self.tree.column(c, width=w, minwidth=40, stretch=stretch, anchor="center" if c == "chk" else "w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         sb = ctk.CTkScrollbar(mid, command=self.tree.yview)
         sb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
@@ -597,7 +606,7 @@ class TagFixWindow(ctk.CTkToplevel):
         self.cover_lbl = ctk.CTkLabel(detail, text="", width=110, height=110)
         self.cover_lbl.grid(row=0, column=0, padx=12, pady=12)
         self.detail_lbl = ctk.CTkLabel(detail, text="목록에서 곡을 선택하면 자세한 내용이 보입니다.",
-                                       font=self.font(12), anchor="nw", justify="left", wraplength=820)
+                                       font=self.font(12), anchor="nw", justify="left", wraplength=840)
         self.detail_lbl.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
 
         foot = ctk.CTkFrame(self, fg_color="transparent")
@@ -619,63 +628,14 @@ class TagFixWindow(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self.focus)
 
-    # ───── 검사 ─────
-    def start_or_stop(self):
-        if self.phase == "analyzing":
-            self.stop_flag.set()
-            self.start_btn.configure(state="disabled", text="중지 중…")
-            return
-        if self.phase != "idle":
-            return
-        self.phase = "analyzing"
-        self.start_btn.configure(text="중지")
-        self.undo_btn.configure(state="disabled")
-        threading.Thread(target=self._analyze_worker, daemon=True).start()
-        self.after(300, self._poll)
+    # ───── 옵션 ─────
+    def fmt(self):
+        return self.fmt_labels.get(self.fmt_menu.get(), "title_artist")
 
-    def _analyze_worker(self):
-        http = tf.Http()
-        for p in self.paths:
-            if self.stop_flag.is_set():
-                break
-            try:
-                sug = tf.analyze(p, http)
-                if tf.has_anything(sug):
-                    self.suggestions.append(sug)
-                else:
-                    self.progress["skipped"] += 1
-            except Exception:
-                self.progress["skipped"] += 1
-            self.progress["done"] += 1
-        self.worker_done = True
-
-    def _poll(self):
-        if not self.winfo_exists():
-            return
-        pr = self.progress
-        while self._inserted < len(self.suggestions):
-            i = self._inserted
-            self.checked.add(i)
-            self.tree.insert("", "end", iid=str(i), values=self._row_values(i))
-            self._inserted += 1
-        total = max(pr["total"], 1)
-        self.bar.set(pr["done"] / total)
-        finished = self.worker_done
-        if self.phase == "analyzing" and not finished:
-            left = round((pr["total"] - pr["done"]) * 1.4 / 60)
-            self.status.configure(text=f"검사 중… {pr['done']} / {pr['total']} · 수정안 {len(self.suggestions)}곡"
-                                       f" · 남은 시간 약 {max(left, 1)}분")
-            self.update_apply_btn()
-            self.after(300, self._poll)
-            return
-        if self.phase == "analyzing":
-            self.phase = "done"
-            self.start_btn.configure(text="검사 완료", state="disabled")
-            stopped = " (중지됨)" if pr["done"] < pr["total"] else ""
-            self.status.configure(text=f"검사 끝{stopped}: {pr['done']}곡 중 {len(self.suggestions)}곡에 수정안이 있습니다. "
-                                       "체크를 확인하고 '적용'을 누르세요. 행을 클릭하면 자세히 볼 수 있습니다.")
-            self.undo_btn.configure(state="normal" if BACKUP_FILE.exists() else "disabled")
-            self.update_apply_btn()
+    def on_format(self, _=None):
+        self.app.data["name_format"] = self.fmt()
+        save_data(self.app.data)
+        self.refresh_rows()
 
     def _opts(self):
         fields = []
@@ -686,28 +646,139 @@ class TagFixWindow(ctk.CTkToplevel):
         return dict(use_fields=tuple(fields), use_cover=self.opt_cover.get(), use_name=self.opt_name.get())
 
     def _effective(self, sug):
-        """옵션을 반영한 수정안(체크 해제된 항목 제외)."""
+        """옵션을 반영한 실제 적용 내용."""
         o = self._opts()
         return {"changes": {f: v for f, v in sug["changes"].items() if f in o["use_fields"]},
                 "cover": sug["cover"] if o["use_cover"] else None,
-                "new_name": sug["new_name"] if o["use_name"] else None}
+                "new_name": tf.filename_for(sug, self.fmt()) if o["use_name"] else None}
 
-    def _row_values(self, i):
-        sug = self.suggestions[i]
-        eff = self._effective(sug)
-        text = tf.summarize({**sug, **eff}) or "(선택한 옵션으로는 바뀌는 내용 없음)"
-        conf = f"{int(sug['confidence'] * 100)}%" if sug["matched"] else "파일명 기준"
-        return ("▣" if i in self.checked else "□", Path(sug["path"]).name, text, conf)
+    def _has(self, i):
+        e = self._effective(self.sugs[i])
+        return bool(e["changes"] or e["cover"] or e["new_name"])
+
+    # ───── 검사 ─────
+    def start_or_stop(self):
+        if self.phase in ("local", "online"):
+            self.stop_flag.set()
+            self.start_btn.configure(state="disabled", text="중지 중…")
+            return
+        if self.phase != "idle":
+            return
+        self.phase = "local"
+        self.start_btn.configure(text="중지")
+        self.undo_btn.configure(state="disabled")
+        self.online_chk.configure(state="disabled")
+        library = [t["path"] for t in self.app.tracks]
+        fmt, online = self.fmt(), self.opt_online.get()
+
+        def worker():
+            pr = self.progress
+            pr["stage"] = "local"
+
+            def prog(done, total):
+                pr["done"], pr["total"] = done, total
+
+            try:
+                sugs = tf.analyze_local(self.paths, library, fmt, progress=prog)
+            except Exception as e:
+                sugs = []
+                pr["error"] = str(e)
+            self.sugs = sugs
+            pr["stage"] = "local_done"
+            if not online or self.stop_flag.is_set():
+                pr["stage"] = "finished"
+                return
+            pr["stage"], pr["done"], pr["total"] = "online", 0, tf.count_online_lookups(sugs)
+            cache = load_online_cache()
+
+            def oprog(done, total):
+                pr["done"], pr["total"] = done, total
+
+            try:
+                tf.online_fill(sugs, tf.Http(), cache, progress=oprog, stop=self.stop_flag)
+            except Exception as e:
+                pr["error"] = str(e)
+            save_online_cache(cache)
+            pr["stage"] = "finished"
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(150, self._poll)
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        pr = self.progress
+        stage = pr["stage"]
+        if stage in ("local_done", "online", "finished") and not self.tree.get_children() and self.sugs \
+                and not getattr(self, "_rows_built", False):
+            self.checked = set(range(len(self.sugs)))
+            self._rows_built = True
+            self.refresh_rows()
+            if stage != "finished":
+                self.phase = "online"
+        total = max(pr["total"], 1)
+        self.bar.set(pr["done"] / total)
+        if stage in ("", "local"):
+            self.status.configure(text=f"태그 읽는 중… {pr['done']} / {pr['total']}")
+        elif stage == "online":
+            left = (pr["total"] - pr["done"]) * 1.15
+            eta = f"{int(left // 60)}분 {int(left % 60)}초" if left >= 60 else f"{int(left)}초"
+            self.status.configure(text=f"온라인 검색 중… 앨범 {pr['done']} / {pr['total']}개 · 최대 약 {eta} 남음"
+                                       " (이전에 찾은 앨범은 바로 넘어갑니다) · 중지하면 지금까지 찾은 결과로 적용할 수 있습니다.")
+            if time.monotonic() - getattr(self, "_last_refresh", 0) > 2:
+                self._last_refresh = time.monotonic()
+                self.refresh_rows()
+        if stage != "finished":
+            self.after(400, self._poll)
+            return
+        self.phase = "done"
+        self.refresh_rows()
+        n = sum(1 for i in range(len(self.sugs)) if self._has(i))
+        stopped = " (중지됨)" if self.stop_flag.is_set() else ""
+        err = f" · 오류: {pr['error']}" if pr.get("error") else ""
+        self.status.configure(text=f"검사 끝{stopped}: {len(self.sugs)}곡 중 {n}곡에 수정안이 있습니다{err}. "
+                                   "행을 클릭하면 이유와 자세한 내용이 보이고, ▣를 누르면 뺄 수 있습니다.")
+        self.bar.set(1)
+        self.start_btn.configure(text="검사 완료", state="disabled")
+        self.undo_btn.configure(state="normal" if BACKUP_FILE.exists() else "disabled")
+        self.update_apply_btn()
+
+    # ───── 목록 ─────
+    def _why(self, sug, eff):
+        reasons = []
+        notes = " ".join(sug["notes"])
+        if "다른 표기" in notes:
+            reasons.append("표기 통일")
+        if "깨진 글자" in notes:
+            reasons.append("깨진 글자")
+        if "파일명에서 가져옴" in notes:
+            reasons.append("빈 태그")
+        if sug["matched"] and (eff["cover"] or any(f in eff["changes"] for f in ("album", "genre"))
+                               and eff["changes"].get("album", ("x",))[0] == ""):
+            reasons.append("온라인")
+        if eff["new_name"] and not reasons:
+            reasons.append("파일명 형식")
+        return ", ".join(reasons)
 
     def refresh_rows(self):
-        for iid in self.tree.get_children():
-            self.tree.item(iid, values=self._row_values(int(iid)))
+        sel = self.tree.selection()
+        top = self.tree.yview()[0]
+        self.tree.delete(*self.tree.get_children())
+        for i, sug in enumerate(self.sugs):
+            if not self._has(i):
+                continue
+            eff = self._effective(sug)
+            text = tf.summarize({**sug, "changes": eff["changes"], "cover": eff["cover"]}, self.fmt(),
+                                use_name=bool(eff["new_name"]))
+            self.tree.insert("", "end", iid=str(i), values=("▣" if i in self.checked else "□",
+                                                            Path(sug["path"]).name, text, self._why(sug, eff)))
+        if sel and self.tree.exists(sel[0]):
+            self.tree.selection_set(sel[0])
+        self.tree.yview_moveto(top)
         self.update_apply_btn()
-        self.on_select()
 
     def update_apply_btn(self):
-        n = sum(1 for i in self.checked if tf.has_anything({**self.suggestions[i],
-                                                            **self._effective(self.suggestions[i])}))
+        n = sum(1 for i in self.checked if i < len(self.sugs) and self._has(i))
         ok = n > 0 and self.phase == "done"
         self.apply_btn.configure(text=f"적용 ({n}곡)", state="normal" if ok else "disabled")
 
@@ -720,7 +791,9 @@ class TagFixWindow(ctk.CTkToplevel):
 
     def toggle(self, i):
         (self.checked.discard if i in self.checked else self.checked.add)(i)
-        self.tree.item(str(i), values=self._row_values(i))
+        vals = list(self.tree.item(str(i), "values"))
+        vals[0] = "▣" if i in self.checked else "□"
+        self.tree.item(str(i), values=vals)
         self.update_apply_btn()
 
     def toggle_selected(self):
@@ -729,14 +802,14 @@ class TagFixWindow(ctk.CTkToplevel):
             self.toggle(int(sel[0]))
 
     def check_all(self, on):
-        self.checked = set(range(self._inserted)) if on else set()
+        self.checked = set(range(len(self.sugs))) if on else set()
         self.refresh_rows()
 
     def on_select(self, _=None):
         sel = self.tree.selection()
         if not sel:
             return
-        sug = self.suggestions[int(sel[0])]
+        sug = self.sugs[int(sel[0])]
         eff = self._effective(sug)
         lines = [f"파일: {sug['path']}"]
         for f, (old, new) in eff["changes"].items():
@@ -745,8 +818,10 @@ class TagFixWindow(ctk.CTkToplevel):
             lines.append(f"파일명:  {Path(sug['path']).name}  →  {eff['new_name']}")
         if eff["cover"]:
             lines.append("커버:  없음  →  왼쪽 이미지 추가")
-        if not sug["matched"]:
-            lines.append("※ 온라인에서 일치하는 곡을 찾지 못해 기존 태그와 파일명만으로 만든 수정안입니다.")
+        for note in sug["notes"]:
+            lines.append(f"· {note}")
+        if sug["matched"]:
+            lines.append(f"· 온라인(MusicBrainz) 일치도 {int(sug['confidence'] * 100)}%")
         self.detail_lbl.configure(text="\n".join(lines))
         if eff["cover"]:
             try:
@@ -763,10 +838,10 @@ class TagFixWindow(ctk.CTkToplevel):
     def apply(self):
         items = []
         for i in sorted(self.checked):
-            eff = self._effective(self.suggestions[i])
-            sug = {**self.suggestions[i], **eff}
-            if tf.has_anything(sug):
-                items.append(sug)
+            if i >= len(self.sugs) or not self._has(i):
+                continue
+            eff = self._effective(self.sugs[i])
+            items.append({**self.sugs[i], **eff})
         if not items:
             return
         if not messagebox.askyesno("태그 정리", f"{len(items)}곡의 파일을 수정합니다.\n"
@@ -855,6 +930,26 @@ class TagFixWindow(ctk.CTkToplevel):
             return  # 파일을 쓰는 중에는 닫지 않는다
         self.stop_flag.set()
         self.destroy()
+
+
+ONLINE_CACHE = DATA_DIR / "online_cache.json"
+
+
+def load_online_cache():
+    try:
+        with open(ONLINE_CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_online_cache(cache):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ONLINE_CACHE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 def save_backup(entries):
