@@ -10,6 +10,7 @@ import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")  # 콘솔 없는 exe에서 안내 문구 출력 방지
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -343,30 +344,90 @@ def make_icon(kind, size, color):
     return img.resize((size, size), Image.LANCZOS)
 
 
-def make_heart(size, color, filled=True, stroke=0.09):
-    """하트 아이콘. filled=False면 테두리만 그린다. 4배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
-    import math
-    S = size * 4
+# Material Icons 'favorite' / 'favorite_border' (Google, Apache License 2.0), 24×24 좌표계
+HEART_FILLED = ("M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09"
+                "C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z")
+HEART_OUTLINE = ("M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5"
+                 "c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3z"
+                 "m-4.4 15.55l-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87"
+                 "C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z")
 
-    def heart_mask(scale):
-        pts = []
-        for i in range(240):
-            t = 2 * math.pi * i / 240
-            x = 16 * math.sin(t) ** 3
-            y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
-            pts.append((S / 2 + x * S / 36 * scale, S * 0.47 - y * S / 36 * scale))
+
+def _svg_subpaths(d, steps=24):
+    """M/L/H/V/C/Z(대소문자)만 쓰는 SVG 경로를 점 목록들로 바꾼다."""
+    tokens = re.findall(r"[MmLlHhVvCcZz]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?", d)
+    paths, pts = [], []
+    x = y = sx = sy = 0.0
+    i, cmd = 0, None
+
+    def num():
+        nonlocal i
+        i += 1
+        return float(tokens[i - 1])
+
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd = tokens[i]
+            i += 1
+            if cmd in "Zz":
+                if pts:
+                    paths.append(pts)
+                pts, x, y = [], sx, sy
+                continue
+        rel = cmd.islower()
+        c = cmd.upper()
+        if c == "M":
+            if pts:
+                paths.append(pts)
+            nx, ny = num(), num()
+            x, y = (x + nx, y + ny) if rel else (nx, ny)
+            sx, sy, pts = x, y, [(x, y)]
+            cmd = "l" if rel else "L"  # M 뒤의 추가 좌표는 L로 처리
+        elif c == "L":
+            nx, ny = num(), num()
+            x, y = (x + nx, y + ny) if rel else (nx, ny)
+            pts.append((x, y))
+        elif c == "H":
+            nx = num()
+            x = x + nx if rel else nx
+            pts.append((x, y))
+        elif c == "V":
+            ny = num()
+            y = y + ny if rel else ny
+            pts.append((x, y))
+        elif c == "C":
+            v = [num() for _ in range(6)]
+            if rel:
+                v = [v[k] + (x if k % 2 == 0 else y) for k in range(6)]
+            x1, y1, x2, y2, ex, ey = v
+            for k in range(1, steps + 1):
+                t = k / steps
+                mt = 1 - t
+                pts.append((mt ** 3 * x + 3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t ** 3 * ex,
+                            mt ** 3 * y + 3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t ** 3 * ey))
+            x, y = ex, ey
+    if pts:
+        paths.append(pts)
+    return paths
+
+
+def render_svg_path(d, size, color, box=24):
+    """경로를 8배 크기로 칠한 뒤 줄여 매끄러운 아이콘을 만든다(짝홀 규칙으로 구멍 처리)."""
+    from PIL import ImageChops
+    S = size * 8
+    k = S / box
+    mask = Image.new("L", (S, S), 0)
+    for sub in _svg_subpaths(d):
         m = Image.new("L", (S, S), 0)
-        ImageDraw.Draw(m).polygon(pts, fill=255)
-        return m
-
-    mask = heart_mask(1.0)
-    if not filled:  # 안쪽을 일정한 두께만큼 깎아 테두리만 남긴다
-        from PIL import ImageChops, ImageFilter
-        k = max(3, int(S * stroke) | 1)
-        mask = ImageChops.subtract(mask, mask.filter(ImageFilter.MinFilter(k)))
+        ImageDraw.Draw(m).polygon([(px * k, py * k) for px, py in sub], fill=255)
+        mask = ImageChops.logical_xor(mask.convert("1"), m.convert("1")).convert("L")
     img = Image.new("RGBA", (S, S), color)
     img.putalpha(mask)
     return img.resize((size, size), Image.LANCZOS)
+
+
+def make_heart(size, color, filled=True):
+    return render_svg_path(HEART_FILLED if filled else HEART_OUTLINE, size, color)
 
 
 def ctk_icon(kind, size, light_color, dark_color):
