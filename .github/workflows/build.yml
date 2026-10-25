@@ -6,6 +6,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "launcher.py"
       - "music_player.py"
       - "tag_fixer.py"
       - "requirements.txt"
@@ -35,7 +36,7 @@ jobs:
           [System.IO.File]::WriteAllText("app_info.json", $info)
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name MusicPlayer --collect-data customtkinter --add-data "app_info.json;." music_player.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name MusicPlayer --collect-data customtkinter --add-data "app_info.json;." launcher.py
 
       - name: Zip
         shell: pwsh

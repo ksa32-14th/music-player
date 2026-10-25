@@ -75,13 +75,63 @@ def http_get(url, timeout=10):
 
 
 def fetch_latest_release(repo):
-    """GitHub 최신 릴리스를 조회한다. 반환: (버전 문자열, zip 다운로드 주소) 또는 None."""
+    """GitHub 최신 릴리스를 조회한다. 반환: (태그, zip 다운로드 주소 또는 None) 또는 None."""
     with http_get(f"https://api.github.com/repos/{repo}/releases/latest") as r:
         data = json.load(r)
-    asset = next((a for a in data.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
-    if not asset:
+    tag = data.get("tag_name", "")
+    if not tag:
         return None
-    return data.get("tag_name", ""), asset["browser_download_url"]
+    asset = next((a for a in data.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
+    return tag, asset["browser_download_url"] if asset else None
+
+
+# ── 코드 업데이트 ──
+# exe를 내려받아 바꾸면 백신(Windows Defender 등)이 서명 없는 exe를 지우는 경우가 있다.
+# 그래서 exe는 그대로 두고 파이썬 코드 파일만 내려받아 %APPDATA%\ModernMusicPlayer\code\<버전>\에 둔다.
+# exe(launcher)는 시작할 때 가장 새 코드를 불러온다.
+CODE_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer" / "code"
+CODE_FILES = ("music_player.py", "tag_fixer.py")
+REQUIRES_LAUNCHER = 1     # 이 코드를 실행하는 데 필요한 launcher 버전(새 라이브러리가 필요해지면 올린다)
+APP_VERSION = None        # launcher가 넣어 준다
+LAUNCHER_VERSION = None   # launcher가 넣어 준다(구버전 exe에서는 None)
+
+
+def download_code(repo, tag):
+    """태그 시점의 코드 파일을 내려받아 문법을 확인한 뒤 code/<버전>에 저장한다. 필요한 launcher 버전을 돌려준다."""
+    version = tag.lstrip("vV")
+    CODE_DIR.mkdir(parents=True, exist_ok=True)
+    part = CODE_DIR / f".{version}.part"
+    shutil.rmtree(part, ignore_errors=True)
+    part.mkdir()
+    need = 1
+    try:
+        for name in CODE_FILES:
+            with http_get(f"https://raw.githubusercontent.com/{repo}/{tag}/{name}", timeout=30) as r:
+                data = r.read()
+            compile(data, name, "exec")  # 깨진 파일이면 여기서 오류
+            m = re.search(rb"^REQUIRES_LAUNCHER\s*=\s*(\d+)", data, re.M)
+            if m:
+                need = max(need, int(m.group(1)))
+            (part / name).write_bytes(data)
+    except Exception:
+        shutil.rmtree(part, ignore_errors=True)
+        raise
+    final = CODE_DIR / version
+    shutil.rmtree(final, ignore_errors=True)
+    part.rename(final)
+    # 오래된 코드는 최근 3개만 남긴다
+    olds = sorted((d for d in CODE_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")),
+                  key=lambda d: version_tuple(d.name), reverse=True)
+    for d in olds[3:]:
+        shutil.rmtree(d, ignore_errors=True)
+    return need
+
+
+def restart_app():
+    """같은 exe를 새로 실행한다(exe는 바뀌지 않으므로 백신 문제가 없다)."""
+    exe = Path(sys.executable).resolve()
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([str(exe)], cwd=str(exe.parent), creationflags=flags, close_fds=True)
 
 
 def download_and_extract(url, progress=None):
@@ -1031,6 +1081,8 @@ class MusicApp(ctk.CTk):
             self.view_count.configure(text="왼쪽 아래 '음악 폴더 선택'을 눌러 라이브러리를 불러오세요.")
 
         self.version, self.repo = app_info()
+        if APP_VERSION:
+            self.version = APP_VERSION
         if self.version:
             self.title(f"{APP_NAME}  v{self.version}")
         if self.version and self.repo and getattr(sys, "frozen", False):
@@ -1055,30 +1107,38 @@ class MusicApp(ctk.CTk):
             return
         self.update_btn_state("업데이트를 내려받는 중…")
 
-        def progress(ratio):
-            self.after(0, lambda: self.update_btn_state(f"업데이트를 내려받는 중… {int(ratio * 100)}%"))
-
         def worker():
             try:
-                new_dir = download_and_extract(url, progress)
+                need = download_code(self.repo, tag)
             except Exception as e:
                 err = str(e)
+                ulog(f"code download failed: {err}")
                 self.after(0, lambda: messagebox.showerror(APP_NAME, f"업데이트를 내려받지 못했습니다.\n{err}"))
                 self.after(0, self.refresh_list)
                 return
-            self.after(0, lambda: self.finish_update(new_dir))
+            ulog(f"code {tag} downloaded (needs launcher {need}, have {LAUNCHER_VERSION})")
+            self.after(0, lambda: self.finish_update(tag, url, need))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def update_btn_state(self, text):
         self.view_count.configure(text=text)
 
-    def finish_update(self, new_dir):
-        try:
-            launch_updater(new_dir)
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"업데이트를 설치하지 못했습니다.\n{e}")
+    def finish_update(self, tag, url, need):
+        if not LAUNCHER_VERSION or need > LAUNCHER_VERSION:
+            # 이번 업데이트는 exe 자체를 바꿔야 한다(처음 한 번, 또는 새 라이브러리가 필요할 때)
+            messagebox.showinfo(
+                APP_NAME, f"이번 업데이트({tag})는 프로그램 파일 전체를 새로 받아야 합니다.\n\n"
+                          "확인을 누르면 다운로드 페이지가 열립니다. MusicPlayer.zip을 받아 압축을 풀고 "
+                          "기존 폴더에 덮어쓴 뒤 실행하세요. 이후 업데이트는 자동으로 됩니다.")
+            import webbrowser
+            webbrowser.open(f"https://github.com/{self.repo}/releases/latest")
+            self.refresh_list()
             return
+        try:
+            restart_app()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"프로그램을 다시 열지 못했습니다. 직접 다시 실행해 주세요.\n{e}")
         self.on_close()
 
     def font(self, size, weight="normal"):
@@ -1698,7 +1758,7 @@ class MusicApp(ctk.CTk):
         self.destroy()
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "--apply-update":
         try:
             run_update_helper(sys.argv[2], int(sys.argv[3]))
@@ -1707,7 +1767,11 @@ if __name__ == "__main__":
             ctypes_msg(f"업데이트 중 오류가 발생했습니다.\n{e}")
         sys.exit(0)
     if getattr(sys, "frozen", False):
-        t = threading.Timer(15, cleanup_old_updates)  # 업데이트 도우미가 완전히 끝난 뒤 정리
+        t = threading.Timer(15, cleanup_old_updates)  # 지난 방식의 업데이트 임시 폴더 정리
         t.daemon = True
         t.start()
     MusicApp().mainloop()
+
+
+if __name__ == "__main__":
+    main()
