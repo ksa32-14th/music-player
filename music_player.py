@@ -1,5 +1,5 @@
 """
-Modern Music Player
+Music Player
 - UI: CustomTkinter (+ ttk.Treeview 다크/라이트 스타일)
 - 재생: pygame-ce (pygame.mixer.music)
 - 태그: mutagen
@@ -29,7 +29,7 @@ from mutagen import File as MutagenFile
 from mutagen.id3 import ID3
 from PIL import Image, ImageDraw
 
-APP_NAME = "Modern Music Player"
+APP_NAME = "Music Player"
 DATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer"
 DATA_FILE = DATA_DIR / "data.json"
 UI_FONT = "Malgun Gothic" if sys.platform.startswith("win") else "Helvetica"
@@ -43,8 +43,8 @@ UNKNOWN_ALBUM = "알 수 없는 앨범"
 # app_info.json은 GitHub Actions가 빌드할 때 만들어 exe에 넣는다.
 # 예: {"version": "1.0.12", "repo": "사용자이름/저장소이름"}
 # 파이썬으로 직접 실행할 때는 이 파일이 없으므로 업데이트 확인을 하지 않는다.
-EXE_NAME = "ModernMusicPlayer.exe"
-UPDATE_ASSET = "ModernMusicPlayer.zip"
+EXE_NAME = "MusicPlayer.exe"
+UPDATE_ASSET = "MusicPlayer.zip"
 
 
 def app_info():
@@ -66,7 +66,7 @@ def version_tuple(v):
 
 
 def http_get(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": "ModernMusicPlayer-Updater",
+    req = urllib.request.Request(url, headers={"User-Agent": "MusicPlayer-Updater",
                                                "Accept": "application/vnd.github+json"})
     return urllib.request.urlopen(req, timeout=timeout)
 

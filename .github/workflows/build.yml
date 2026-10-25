@@ -34,13 +34,13 @@ jobs:
           [System.IO.File]::WriteAllText("app_info.json", $info)
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name ModernMusicPlayer --collect-data customtkinter --add-data "app_info.json;." music_player.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name MusicPlayer --collect-data customtkinter --add-data "app_info.json;." music_player.py
 
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path dist\ModernMusicPlayer -DestinationPath ModernMusicPlayer.zip
+        run: Compress-Archive -Path dist\MusicPlayer -DestinationPath MusicPlayer.zip
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v1.0.${{ github.run_number }}" ModernMusicPlayer.zip --title "v1.0.${{ github.run_number }}" --notes "Automatic build from ${{ github.sha }}"
+        run: gh release create "v1.0.${{ github.run_number }}" MusicPlayer.zip --title "v1.0.${{ github.run_number }}" --notes "Automatic build from ${{ github.sha }}"
