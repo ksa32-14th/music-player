@@ -10,7 +10,6 @@ import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")  # 콘솔 없는 exe에서 안내 문구 출력 방지
 
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +27,8 @@ import pygame
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3
 from PIL import Image, ImageDraw
+
+import tag_fixer as tf
 
 APP_NAME = "Music Player"
 DATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer"
@@ -324,6 +325,14 @@ class Player:
         self.loaded = self.paused = False
         self.offset = 0.0
 
+    def release(self):
+        """재생을 멈추고 파일 핸들을 놓는다(파일 수정·이름 변경 전에 필요)."""
+        self.stop()
+        try:
+            pygame.mixer.music.unload()
+        except (AttributeError, pygame.error):
+            pass
+
     def seek(self, sec):
         if not self.loaded:
             return
@@ -358,6 +367,366 @@ class Player:
         )
 
 
+# ───────────────────────── 태그 정리 창 ─────────────────────────
+BACKUP_FILE = DATA_DIR / "tag_backup.json"
+
+
+class TagFixWindow(ctk.CTkToplevel):
+    """곡 정보를 온라인에서 찾아 수정안을 보여 주고, 체크한 항목을 일괄 적용한다."""
+
+    def __init__(self, app, paths, scope):
+        super().__init__(app)
+        self.app = app
+        self.paths = paths
+        self.title("태그 정리")
+        self.geometry("1040x700")
+        self.minsize(860, 560)
+        self.transient(app)
+        self.font = app.font
+
+        self.suggestions = []  # tf.analyze 결과 중 바꿀 것이 있는 것
+        self.checked = set()   # suggestions 인덱스
+        self._inserted = 0
+        self.phase = "idle"    # idle | analyzing | applying | done
+        self.stop_flag = threading.Event()
+        self.worker_done = False
+        self.progress = {"done": 0, "total": len(paths), "skipped": 0}
+        self._preview = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="태그 정리", font=self.font(22, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        eta = max(1, round(len(paths) * 1.4 / 60))
+        self.status = ctk.CTkLabel(
+            head, anchor="w", justify="left", font=self.font(12), text_color=("#555555", "#a8a8a8"),
+            text=f"대상: {scope} {len(paths)}곡 · 예상 소요 약 {eta}분\n"
+                 "MusicBrainz에서 곡 정보를 찾고 Cover Art Archive에서 커버를 찾습니다. "
+                 "아무것도 바로 바뀌지 않으며, 확인한 뒤 '적용'을 눌러야 파일이 수정됩니다.")
+        self.status.grid(row=1, column=0, sticky="w", pady=(2, 6))
+        self.bar = ctk.CTkProgressBar(head, height=8)
+        self.bar.set(0)
+        self.bar.grid(row=2, column=0, sticky="ew")
+        self.start_btn = ctk.CTkButton(head, text="검사 시작", width=110, height=34, corner_radius=17,
+                                       font=self.font(13, "bold"), command=self.start_or_stop)
+        self.start_btn.grid(row=0, column=1, rowspan=2, padx=(12, 0))
+
+        opts = ctk.CTkFrame(self, fg_color="transparent")
+        opts.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 4))
+        self.opt_info = ctk.BooleanVar(value=True)
+        self.opt_genre = ctk.BooleanVar(value=True)
+        self.opt_cover = ctk.BooleanVar(value=True)
+        self.opt_name = ctk.BooleanVar(value=True)
+        for text, var in (("제목·아티스트·앨범", self.opt_info), ("장르", self.opt_genre),
+                          ("커버", self.opt_cover), ("파일명", self.opt_name)):
+            ctk.CTkCheckBox(opts, text=text, variable=var, font=self.font(12),
+                            command=self.refresh_rows).pack(side="left", padx=(0, 16))
+
+        mid = ctk.CTkFrame(self, fg_color="transparent")
+        mid.grid(row=2, column=0, sticky="nsew", padx=20, pady=4)
+        mid.grid_columnconfigure(0, weight=1)
+        mid.grid_rowconfigure(0, weight=1)
+        cols = ("chk", "file", "summary", "conf")
+        self.tree = ttk.Treeview(mid, columns=cols, show="headings", style="Music.Treeview", selectmode="browse")
+        for c, text, w, stretch in (("chk", "", 40, False), ("file", "파일", 230, False),
+                                    ("summary", "바뀌는 내용", 620, True), ("conf", "일치도", 70, False)):
+            self.tree.heading(c, text=text, anchor="center" if c in ("chk", "conf") else "w")
+            self.tree.column(c, width=w, minwidth=40, stretch=stretch,
+                             anchor="center" if c in ("chk", "conf") else "w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb = ctk.CTkScrollbar(mid, command=self.tree.yview)
+        sb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<Button-1>", self.on_click)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<space>", lambda e: self.toggle_selected())
+
+        detail = ctk.CTkFrame(self, corner_radius=12)
+        detail.grid(row=3, column=0, sticky="ew", padx=20, pady=6)
+        detail.grid_columnconfigure(1, weight=1)
+        self.cover_lbl = ctk.CTkLabel(detail, text="", width=110, height=110)
+        self.cover_lbl.grid(row=0, column=0, padx=12, pady=12)
+        self.detail_lbl = ctk.CTkLabel(detail, text="목록에서 곡을 선택하면 자세한 내용이 보입니다.",
+                                       font=self.font(12), anchor="nw", justify="left", wraplength=820)
+        self.detail_lbl.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
+
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 16))
+        small = dict(height=34, corner_radius=17, font=self.font(12), fg_color="transparent", border_width=1,
+                     border_color=("#b5b5b5", "#3a3a3a"), hover_color=("#e2e2e2", "#232323"),
+                     text_color=("#1a1a1a", "#e8e8e8"))
+        ctk.CTkButton(foot, text="모두 선택", width=90, command=lambda: self.check_all(True), **small).pack(side="left")
+        ctk.CTkButton(foot, text="모두 해제", width=90, command=lambda: self.check_all(False),
+                      **small).pack(side="left", padx=8)
+        self.undo_btn = ctk.CTkButton(foot, text="마지막 정리 되돌리기", width=150, command=self.undo_last, **small)
+        self.undo_btn.pack(side="left", padx=(16, 0))
+        if not BACKUP_FILE.exists():
+            self.undo_btn.configure(state="disabled")
+        self.apply_btn = ctk.CTkButton(foot, text="적용", width=130, height=36, corner_radius=18,
+                                       font=self.font(13, "bold"), state="disabled", command=self.apply)
+        self.apply_btn.pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(200, self.focus)
+
+    # ───── 검사 ─────
+    def start_or_stop(self):
+        if self.phase == "analyzing":
+            self.stop_flag.set()
+            self.start_btn.configure(state="disabled", text="중지 중…")
+            return
+        if self.phase != "idle":
+            return
+        self.phase = "analyzing"
+        self.start_btn.configure(text="중지")
+        self.undo_btn.configure(state="disabled")
+        threading.Thread(target=self._analyze_worker, daemon=True).start()
+        self.after(300, self._poll)
+
+    def _analyze_worker(self):
+        http = tf.Http()
+        for p in self.paths:
+            if self.stop_flag.is_set():
+                break
+            try:
+                sug = tf.analyze(p, http)
+                if tf.has_anything(sug):
+                    self.suggestions.append(sug)
+                else:
+                    self.progress["skipped"] += 1
+            except Exception:
+                self.progress["skipped"] += 1
+            self.progress["done"] += 1
+        self.worker_done = True
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        pr = self.progress
+        while self._inserted < len(self.suggestions):
+            i = self._inserted
+            self.checked.add(i)
+            self.tree.insert("", "end", iid=str(i), values=self._row_values(i))
+            self._inserted += 1
+        total = max(pr["total"], 1)
+        self.bar.set(pr["done"] / total)
+        finished = self.worker_done
+        if self.phase == "analyzing" and not finished:
+            left = round((pr["total"] - pr["done"]) * 1.4 / 60)
+            self.status.configure(text=f"검사 중… {pr['done']} / {pr['total']} · 수정안 {len(self.suggestions)}곡"
+                                       f" · 남은 시간 약 {max(left, 1)}분")
+            self.update_apply_btn()
+            self.after(300, self._poll)
+            return
+        if self.phase == "analyzing":
+            self.phase = "done"
+            self.start_btn.configure(text="검사 완료", state="disabled")
+            stopped = " (중지됨)" if pr["done"] < pr["total"] else ""
+            self.status.configure(text=f"검사 끝{stopped}: {pr['done']}곡 중 {len(self.suggestions)}곡에 수정안이 있습니다. "
+                                       "체크를 확인하고 '적용'을 누르세요. 행을 클릭하면 자세히 볼 수 있습니다.")
+            self.undo_btn.configure(state="normal" if BACKUP_FILE.exists() else "disabled")
+            self.update_apply_btn()
+
+    def _opts(self):
+        fields = []
+        if self.opt_info.get():
+            fields += ["title", "artist", "album"]
+        if self.opt_genre.get():
+            fields.append("genre")
+        return dict(use_fields=tuple(fields), use_cover=self.opt_cover.get(), use_name=self.opt_name.get())
+
+    def _effective(self, sug):
+        """옵션을 반영한 수정안(체크 해제된 항목 제외)."""
+        o = self._opts()
+        return {"changes": {f: v for f, v in sug["changes"].items() if f in o["use_fields"]},
+                "cover": sug["cover"] if o["use_cover"] else None,
+                "new_name": sug["new_name"] if o["use_name"] else None}
+
+    def _row_values(self, i):
+        sug = self.suggestions[i]
+        eff = self._effective(sug)
+        text = tf.summarize({**sug, **eff}) or "(선택한 옵션으로는 바뀌는 내용 없음)"
+        conf = f"{int(sug['confidence'] * 100)}%" if sug["matched"] else "파일명 기준"
+        return ("▣" if i in self.checked else "□", Path(sug["path"]).name, text, conf)
+
+    def refresh_rows(self):
+        for iid in self.tree.get_children():
+            self.tree.item(iid, values=self._row_values(int(iid)))
+        self.update_apply_btn()
+        self.on_select()
+
+    def update_apply_btn(self):
+        n = sum(1 for i in self.checked if tf.has_anything({**self.suggestions[i],
+                                                            **self._effective(self.suggestions[i])}))
+        ok = n > 0 and self.phase == "done"
+        self.apply_btn.configure(text=f"적용 ({n}곡)", state="normal" if ok else "disabled")
+
+    def on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_column(event.x) == "#1":
+            row = self.tree.identify_row(event.y)
+            if row:
+                self.toggle(int(row))
+                return "break"
+
+    def toggle(self, i):
+        (self.checked.discard if i in self.checked else self.checked.add)(i)
+        self.tree.item(str(i), values=self._row_values(i))
+        self.update_apply_btn()
+
+    def toggle_selected(self):
+        sel = self.tree.selection()
+        if sel:
+            self.toggle(int(sel[0]))
+
+    def check_all(self, on):
+        self.checked = set(range(self._inserted)) if on else set()
+        self.refresh_rows()
+
+    def on_select(self, _=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        sug = self.suggestions[int(sel[0])]
+        eff = self._effective(sug)
+        lines = [f"파일: {sug['path']}"]
+        for f, (old, new) in eff["changes"].items():
+            lines.append(f"{tf.FIELD_LABEL[f]}:  {old or '(없음)'}  →  {new}")
+        if eff["new_name"]:
+            lines.append(f"파일명:  {Path(sug['path']).name}  →  {eff['new_name']}")
+        if eff["cover"]:
+            lines.append("커버:  없음  →  왼쪽 이미지 추가")
+        if not sug["matched"]:
+            lines.append("※ 온라인에서 일치하는 곡을 찾지 못해 기존 태그와 파일명만으로 만든 수정안입니다.")
+        self.detail_lbl.configure(text="\n".join(lines))
+        if eff["cover"]:
+            try:
+                img = Image.open(BytesIO(eff["cover"][0]))
+                self._preview = ctk.CTkImage(rounded(img, 220, 16), size=(110, 110))
+                self.cover_lbl.configure(image=self._preview)
+                return
+            except Exception:
+                pass
+        self.cover_lbl.configure(image=None)
+        self._preview = None
+
+    # ───── 적용 ─────
+    def apply(self):
+        items = []
+        for i in sorted(self.checked):
+            eff = self._effective(self.suggestions[i])
+            sug = {**self.suggestions[i], **eff}
+            if tf.has_anything(sug):
+                items.append(sug)
+        if not items:
+            return
+        if not messagebox.askyesno("태그 정리", f"{len(items)}곡의 파일을 수정합니다.\n"
+                                             "'마지막 정리 되돌리기'로 이번 변경을 되돌릴 수 있습니다.\n\n계속할까요?",
+                                   parent=self):
+            return
+        self.phase = "applying"
+        self.apply_btn.configure(state="disabled")
+        self.undo_btn.configure(state="disabled")
+        self.app.release_files([s["path"] for s in items])
+        result = {"done": 0, "backups": [], "errors": []}
+
+        def worker():
+            for sug in items:
+                try:
+                    result["backups"].append(tf.apply(sug, use_name=bool(sug["new_name"]),
+                                                      use_cover=bool(sug["cover"]),
+                                                      use_fields=tuple(sug["changes"])))
+                except Exception as e:
+                    result["errors"].append(f"{Path(sug['path']).name}: {e}")
+                result["done"] += 1
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_job(result, len(items), self._apply_done)
+
+    def _poll_job(self, result, total, on_done):
+        if not self.winfo_exists():
+            return
+        self.bar.set(result["done"] / max(total, 1))
+        self.status.configure(text=f"처리 중… {result['done']} / {total}")
+        if result["done"] < total:
+            self.after(200, lambda: self._poll_job(result, total, on_done))
+        else:
+            on_done(result)
+
+    def _apply_done(self, result):
+        if result["backups"]:
+            save_backup(result["backups"])
+        self.app.remap_paths({b["old_path"]: b["new_path"] for b in result["backups"]})
+        msg = f"{len(result['backups'])}곡을 수정했습니다."
+        if result["errors"]:
+            msg += f"\n\n수정하지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
+        messagebox.showinfo("태그 정리", msg, parent=self)
+        self.destroy()
+
+    # ───── 되돌리기 ─────
+    def undo_last(self):
+        entries = load_backup()
+        if not entries:
+            messagebox.showinfo("태그 정리", "되돌릴 기록이 없습니다.", parent=self)
+            return
+        if not messagebox.askyesno("태그 정리", f"마지막으로 정리한 {len(entries)}곡을 원래대로 되돌릴까요?",
+                                   parent=self):
+            return
+        self.phase = "applying"
+        for b in (self.start_btn, self.apply_btn, self.undo_btn):
+            b.configure(state="disabled")
+        self.app.release_files([e["new_path"] for e in entries])
+        result = {"done": 0, "mapping": {}, "errors": []}
+
+        def worker():
+            for e in entries:
+                try:
+                    result["mapping"][e["new_path"]] = tf.undo(e)
+                except Exception as ex:
+                    result["errors"].append(f"{Path(e['new_path']).name}: {ex}")
+                result["done"] += 1
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_job(result, len(entries), self._undo_done)
+
+    def _undo_done(self, result):
+        try:
+            BACKUP_FILE.unlink()
+        except OSError:
+            pass
+        self.app.remap_paths(result["mapping"])
+        msg = f"{len(result['mapping'])}곡을 되돌렸습니다."
+        if result["errors"]:
+            msg += f"\n\n되돌리지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
+        messagebox.showinfo("태그 정리", msg, parent=self)
+        self.destroy()
+
+    def on_close(self):
+        if self.phase == "applying":
+            return  # 파일을 쓰는 중에는 닫지 않는다
+        self.stop_flag.set()
+        self.destroy()
+
+
+def save_backup(entries):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def load_backup():
+    try:
+        with open(BACKUP_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
 # ───────────────────────── 메인 앱 ─────────────────────────
 class MusicApp(ctk.CTk):
     def __init__(self):
@@ -384,6 +753,8 @@ class MusicApp(ctk.CTk):
         self._search_job = None
         self._scan_state = None
         self._fail_streak = 0
+        self._path_remap = {}
+        self.tag_window = None
         self.pl_buttons = {}
 
         self.ph_big = ctk.CTkImage(rounded(placeholder(504), 504, 36), size=(252, 252))
@@ -445,7 +816,8 @@ class MusicApp(ctk.CTk):
             try:
                 new_dir = download_and_extract(url, progress)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(APP_NAME, f"업데이트를 내려받지 못했습니다.\n{e}"))
+                err = str(e)
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"업데이트를 내려받지 못했습니다.\n{err}"))
                 self.after(0, self.refresh_list)
                 return
             self.after(0, lambda: self.finish_update(new_dir))
@@ -506,10 +878,14 @@ class MusicApp(ctk.CTk):
                                          font=self.font(11), text_color=("#6b6b6b", "#8a8a8a"), anchor="w")
         self.folder_label.grid(row=5, column=0, padx=22, pady=(8, 2), sticky="ew")
         ctk.CTkButton(sb, text="음악 폴더 선택", height=36, corner_radius=18, font=self.font(13, "bold"),
-                      command=self.choose_folder).grid(row=6, column=0, padx=18, pady=(2, 10), sticky="ew")
+                      command=self.choose_folder).grid(row=6, column=0, padx=18, pady=(2, 6), sticky="ew")
+        ctk.CTkButton(sb, text="태그 정리", height=36, corner_radius=18, font=self.font(13, "bold"),
+                      fg_color="transparent", border_width=1, border_color=("#b5b5b5", "#3a3a3a"),
+                      hover_color=("#e2e2e2", "#232323"), text_color=("#1a1a1a", "#e8e8e8"),
+                      command=self.open_tag_fixer).grid(row=7, column=0, padx=18, pady=(0, 10), sticky="ew")
 
         self.theme_switch = ctk.CTkSwitch(sb, text="다크 모드", font=self.font(12), command=self.toggle_theme)
-        self.theme_switch.grid(row=7, column=0, padx=22, pady=(0, 20), sticky="w")
+        self.theme_switch.grid(row=8, column=0, padx=22, pady=(0, 20), sticky="w")
         if ctk.get_appearance_mode() == "Dark":
             self.theme_switch.select()
 
@@ -689,6 +1065,16 @@ class MusicApp(ctk.CTk):
             return
         self.tracks = st["result"]
         self.by_path = {t["path"]: t for t in self.tracks}
+        if self.queue:  # 파일 이름이 바뀌었을 수 있으므로 대기열을 새 목록에 맞춘다
+            remap = self._path_remap
+            cur = self.queue[self.queue_index]["path"] if 0 <= self.queue_index < len(self.queue) else None
+            self.queue = [self.by_path[remap.get(t["path"], t["path"])] for t in self.queue
+                          if remap.get(t["path"], t["path"]) in self.by_path]
+            new_cur = remap.get(cur, cur)
+            self.queue_index = next((i for i, t in enumerate(self.queue) if t["path"] == new_cur), 0)
+            if self.current:
+                self.current = self.by_path.get(remap.get(self.current["path"], self.current["path"]))
+        self._path_remap = {}
         self.refresh_list()
 
     # ───── 목록 ─────
@@ -996,6 +1382,44 @@ class MusicApp(ctk.CTk):
         elif not self.seeking and self.seek.get() != 0:
             self.seek.set(0)
         self.after(250, self.tick)
+
+    # ───── 태그 정리 연동 ─────
+    def open_tag_fixer(self):
+        if not self.tracks:
+            messagebox.showinfo(APP_NAME, "먼저 음악 폴더를 선택해 곡을 불러오세요.")
+            return
+        if self.tag_window and self.tag_window.winfo_exists():
+            self.tag_window.focus()
+            return
+        sel = self.tree.selection()
+        if len(sel) >= 2:
+            targets, scope = [self.view_tracks[int(i)] for i in sel], "선택한 곡"
+        else:
+            targets = list(self.view_tracks)
+            scope = "검색 결과" if self.search.get().strip() else self.view_title.cget("text")
+        self.tag_window = TagFixWindow(self, [t["path"] for t in targets], scope)
+
+    def release_files(self, paths):
+        """수정할 파일 중 재생 중인 곡이 있으면 재생을 멈춘다."""
+        if self.current and self.current["path"] in set(paths) and self.player.loaded:
+            self.player.release()
+            self.update_play_icon()
+            self.seek.set(0)
+            self.time_now.configure(text="0:00")
+
+    def remap_paths(self, mapping):
+        """파일 이름이 바뀐 뒤 즐겨찾기·플레이리스트·대기열 경로를 맞추고 다시 스캔한다."""
+        mapping = {o: n for o, n in mapping.items() if o != n}
+        if mapping:
+            self.favorites = {mapping.get(p, p) for p in self.favorites}
+            self.data["favorites"] = sorted(self.favorites)
+            for name, paths in self.data["playlists"].items():
+                self.data["playlists"][name] = [mapping.get(p, p) for p in paths]
+            save_data(self.data)
+            self._path_remap = mapping
+        folder = self.data.get("music_folder")
+        if folder and os.path.isdir(folder):
+            self.start_scan(folder)
 
     # ───── 기타 ─────
     def toggle_theme(self):
