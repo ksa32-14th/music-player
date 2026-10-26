@@ -24,6 +24,8 @@ USER_AGENT = "MusicPlayer/1.0 ( https://github.com/ksa32-14th/music-player )"
 MB_SEARCH = "https://musicbrainz.org/ws/2/recording"
 CAA = "https://coverartarchive.org"
 MB_INTERVAL = 1.1  # 초. MusicBrainz 제한(초당 1회)보다 약간 여유를 둔다.
+DZ = "https://api.deezer.com"
+DZ_INTERVAL = 0.2  # 초. Deezer는 공식 제한이 명확히 공개되어 있지 않아 초당 5회로 보수적으로 보낸다.
 FIELDS = ("title", "artist", "album", "genre")
 FIELD_LABEL = {"title": "제목", "artist": "아티스트", "album": "앨범", "genre": "장르"}
 TEXT_FRAMES = {"title": TIT2, "artist": TPE1, "album": TALB, "genre": TCON}
@@ -140,6 +142,8 @@ class Http:
 
     def __init__(self, fetch=None):
         self._last_mb = 0.0
+        self._last_dz = 0.0
+        self._dz_lock = __import__("threading").Lock()
         self.fetch = fetch or self._fetch
 
     @staticmethod
@@ -161,6 +165,24 @@ class Http:
                     time.sleep(3)
                     continue
                 raise
+        return {}
+
+    def dz_json(self, url):
+        """Deezer 요청. 초당 5회 이하로 보내고, 할당량 초과 오류(code 4)면 잠시 쉬고 다시 시도한다."""
+        for attempt in range(4):
+            with self._dz_lock:
+                wait = DZ_INTERVAL - (time.monotonic() - self._last_dz)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_dz = time.monotonic()
+            data = json.loads(self.fetch(url))
+            err = data.get("error") if isinstance(data, dict) else None
+            if err and err.get("code") == 4 and attempt < 3:
+                time.sleep(5)
+                continue
+            if err:
+                raise RuntimeError(f"Deezer: {err.get('message', err)}")
+            return data
         return {}
 
     def get_bytes(self, url):
@@ -347,7 +369,7 @@ def unify_names(counts):
     return result
 
 
-def analyze_local(paths, library_paths=None, fmt="title_artist", progress=None):
+def analyze_local(paths, library_paths=None, fmt="title_artist", progress=None, info=None):
     """인터넷 없이 라이브러리 안에서 표기 차이·깨진 글자·빈 태그·파일명을 점검한다."""
     library_paths = list(dict.fromkeys(list(library_paths or []) + list(paths)))
     raws = {}
@@ -355,6 +377,14 @@ def analyze_local(paths, library_paths=None, fmt="title_artist", progress=None):
         raws[p] = read_raw(p)
         if progress:
             progress(i, len(library_paths))
+
+    if info is not None:  # 라이브러리에서 이미 쓰고 있는 장르(온라인 장르는 이 안에서만 고른다)
+        genres = {}
+        for p in library_paths:
+            g = fix_text(raws[p]["genre"]) if raws[p]["genre"] else ""
+            if g:
+                genres[g] = genres.get(g, 0) + 1
+        info["genres"] = genres
 
     def base_artist(p):
         r = raws[p]
@@ -440,103 +470,355 @@ def filename_for(sug, fmt):
     return name if name != Path(sug["path"]).name else None
 
 
-def _lookup_album(http, artist, album):
-    rgs = search_release_groups(http, album, artist)
-    rg, conf = best_release_group(rgs, album)
+# ───────────────────────── 온라인: Deezer + MusicBrainz 교차 확인 ─────────────────────────
+GENRE_SYNONYMS = {
+    "kpop": {"kpop", "koreanpop", "케이팝", "가요", "아이돌"},
+    "hiphop": {"hiphop", "rap", "랩", "힙합", "rap/hiphop", "랩힙합", "khiphop"},
+    "rnb": {"rnb", "r&b", "알앤비", "rnbsoul", "soul", "알앤비소울"},
+    "ballad": {"ballad", "발라드", "kballad"},
+    "dance": {"dance", "댄스", "electronic", "edm", "일렉트로닉"},
+    "rock": {"rock", "록", "락", "metal", "록메탈"},
+    "pop": {"pop", "팝"},
+    "ost": {"ost", "soundtrack", "films/games", "filmsgames", "영화", "드라마"},
+    "jpop": {"jpop", "jpop", "japanesepop", "제이팝"},
+    "indie": {"indie", "인디", "alternative", "얼터너티브"},
+    "jazz": {"jazz", "재즈"},
+    "classical": {"classical", "클래식"},
+}
+
+
+def _gkey(g):
+    return norm(g.replace("&", "n"))
+
+
+def map_genre(candidates, library_genres):
+    """온라인 장르 후보를 라이브러리에 이미 있는 장르로만 바꾼다. 맞는 것이 없으면 None.
+    'Rap/Hip Hop'처럼 묶인 이름은 나눠서 비교하고, 같은 뜻의 표기(힙합/Hip-Hop 등)도 같은 것으로 본다."""
+    if not library_genres:
+        return None
+    by_key = {}
+    for g, n in library_genres.items():
+        k = _gkey(g)
+        if k and (k not in by_key or n > library_genres[by_key[k]]):
+            by_key[k] = g
+
+    def family(k):
+        return next((f for f, keys in GENRE_SYNONYMS.items() if k in {_gkey(x) for x in keys} or k == f), None)
+
+    for cand in candidates:
+        pieces = [cand] + re.split(r"[/,&]| and ", cand)
+        for piece in pieces:
+            k = _gkey(piece)
+            if not k:
+                continue
+            if k in by_key:
+                return by_key[k]
+            fam = family(k)
+            if fam:
+                same = [g for gk, g in by_key.items() if family(gk) == fam]
+                if same:
+                    return max(same, key=lambda g: library_genres[g])
+    return None
+
+
+def dz_quote(s):
+    return '"' + s.replace('"', " ") + '"'
+
+
+_DZ_GENRES = {}
+
+
+def dz_genre_names(http, album_id=None, genre_id=None):
+    names = []
+    if album_id:
+        data = http.dz_json(f"{DZ}/album/{album_id}")
+        names = [g.get("name", "") for g in (data.get("genres") or {}).get("data", [])]
+        genre_id = genre_id or data.get("genre_id")
+    if not names and genre_id and genre_id > 0:
+        if not _DZ_GENRES:
+            for g in http.dz_json(f"{DZ}/genre").get("data", []):
+                _DZ_GENRES[g.get("id")] = g.get("name", "")
+        if _DZ_GENRES.get(genre_id):
+            names = [_DZ_GENRES[genre_id]]
+    return [n for n in names if n]
+
+
+def dz_lookup_album(http, artist, album):
+    q = f"artist:{dz_quote(artist)} album:{dz_quote(album)}"
+    items = http.dz_json(f"{DZ}/search/album?{urllib.parse.urlencode({'q': q, 'limit': 10})}").get("data", [])
+    if not items:  # 한글/영문 표기 차이 등으로 못 찾으면 자유 검색
+        items = http.dz_json(f"{DZ}/search/album?{urllib.parse.urlencode({'q': f'{artist} {album}', 'limit': 10})}").get("data", [])
+    best, best_s = None, 0.0
+    for it in items:
+        a_sim = similarity(album, it.get("title", ""))
+        art = (it.get("artist") or {}).get("name", "")
+        r_sim = similarity(artist, art) if has_hangul(artist) == has_hangul(art) else 0.6
+        if a_sim < 0.9 or r_sim < 0.5:
+            continue
+        sc = 0.7 * a_sim + 0.3 * r_sim
+        if sc > best_s:
+            best, best_s = it, sc
+    if not best:
+        return None
+    return {"source": "Deezer", "album": best.get("title", ""), "score": round(best_s, 2), "kind": "album",
+            "cover_url": best.get("cover_big") or best.get("cover_medium"),
+            "album_id": best.get("id"), "genre_id": best.get("genre_id")}
+
+
+def dz_lookup_track(http, title, artist, length):
+    q = f"artist:{dz_quote(artist)} track:{dz_quote(title)}" if artist else f"track:{dz_quote(title)}"
+    items = http.dz_json(f"{DZ}/search?{urllib.parse.urlencode({'q': q, 'limit': 10})}").get("data", [])
+    if not items and artist:
+        items = http.dz_json(f"{DZ}/search?{urllib.parse.urlencode({'q': f'{artist} {title}', 'limit': 10})}").get("data", [])
+    best, best_s = None, 0.0
+    for it in items:
+        t_sim = similarity(title, it.get("title", ""))
+        art = (it.get("artist") or {}).get("name", "")
+        cross = bool(artist) and has_hangul(artist) != has_hangul(art)
+        a_sim = 0.6 if cross or not artist else similarity(artist, art)
+        dur = it.get("duration") or 0
+        diff = abs(length - dur) if length and dur else None
+        if t_sim < 0.85 or (not cross and artist and a_sim < 0.5):
+            continue
+        if diff is not None and diff > 4:  # 길이가 다르면 다른 버전(라이브·리믹스 등)일 가능성이 크다
+            continue
+        if cross and diff is None:
+            continue
+        sc = 0.55 * t_sim + 0.3 * a_sim + (0.15 if diff is not None and diff <= 2 else 0.05)
+        if sc > best_s:
+            best, best_s = it, sc
+    if not best:
+        return None
+    al = best.get("album") or {}
+    return {"source": "Deezer", "album": al.get("title", ""), "score": round(min(best_s, 1.0), 2), "kind": "track",
+            "cover_url": al.get("cover_big") or al.get("cover_medium"), "album_id": al.get("id"), "genre_id": None}
+
+
+def mb_lookup_album(http, artist, album):
+    rg, conf = best_release_group(search_release_groups(http, album, artist), album)
     if not rg:
         return None
     tags = sorted(rg.get("tags") or [], key=lambda t: -t.get("count", 0))
-    return {"rgid": rg["id"], "album": rg.get("title", ""), "conf": conf,
-            "genre": pretty_genre(tags[0]["name"]) if tags else "",
-            "releases": [r["id"] for r in rg.get("releases", [])][:2]}
+    rel = [r["id"] for r in rg.get("releases", [])][:2]
+    return {"source": "MusicBrainz", "album": rg.get("title", ""), "score": conf, "kind": "album",
+            "rgid": rg["id"], "releases": rel, "genres": [t["name"] for t in tags[:3]]}
 
 
-def _lookup_track(http, title, artist, length):
+def mb_lookup_track(http, title, artist, length):
     match, conf = best_match(search_recordings(http, title, artist), title, artist, length)
     if not match:
         return None
     release = pick_release(match)
+    if not release:
+        return None
     tags = sorted(match.get("tags") or [], key=lambda t: -t.get("count", 0))
-    rg = (release or {}).get("release-group", {})
-    return {"rgid": rg.get("id"), "album": (release or {}).get("title", ""), "conf": conf,
-            "genre": pretty_genre(tags[0]["name"]) if tags else "",
-            "releases": [release["id"]] if release else []}
+    return {"source": "MusicBrainz", "album": release.get("title", ""), "score": conf, "kind": "track",
+            "rgid": (release.get("release-group") or {}).get("id"), "releases": [release["id"]],
+            "genres": [t["name"] for t in tags[:3]]}
 
 
-CACHE_MISS_DAYS = 14
+def _load_image(data):
+    from PIL import Image
+    try:
+        img = Image.open(BytesIO(data))
+        fmt = img.format
+        img.load()
+        return img, fmt
+    except Exception:
+        return None, None
 
 
-def online_fill(sugs, http, cache, progress=None, stop=None, workers=6):
-    """빈 앨범·장르와 없는 커버를 채운다.
-    - 앨범 태그가 있는 곡은 (아티스트, 앨범)마다 한 번만 검색한다(곡 수가 아니라 앨범 수만큼만 요청).
-    - 커버가 없는 곡을 먼저 처리한다.
-    - 커버 내려받기는 검색과 동시에 여러 개를 병렬로 받는다.
-    - 결과는 cache(dict)에 저장해 다음 검사 때 다시 묻지 않는다."""
-    from concurrent.futures import ThreadPoolExecutor
+def dhash(img):
+    """이미지 지문(64비트). 두 커버가 같은 그림인지 비교하는 데 쓴다."""
+    g = img.convert("L").resize((9, 8))
+    px = list(g.getdata())
+    bits = 0
+    for r in range(8):
+        for c in range(8):
+            bits = (bits << 1) | (px[r * 9 + c] > px[r * 9 + c + 1])
+    return bits
+
+
+def same_picture(h1, h2, limit=12):
+    return bin(h1 ^ h2).count("1") <= limit
+
+
+def download_cover(http, cand):
+    urls = []
+    if cand.get("cover_url"):
+        urls.append(cand["cover_url"])
+    if cand.get("rgid"):
+        urls.append(f"{CAA}/release-group/{cand['rgid']}/front-500")
+    urls += [f"{CAA}/release/{r}/front-500" for r in cand.get("releases", [])]
+    for url in urls:
+        try:
+            data = http.get_bytes(url)
+        except Exception:
+            continue
+        if not data:
+            continue
+        img, fmt = _load_image(data)
+        if img is None or fmt not in ("JPEG", "PNG") or min(img.size) < 200:
+            continue
+        return {"data": data, "mime": "image/jpeg" if fmt == "JPEG" else "image/png",
+                "source": cand["source"], "hash": dhash(img), "size": img.size}
+    return None
+
+
+def decide_group(g, library_genres):
+    """한 그룹(앨범 또는 곡)의 Deezer·MusicBrainz 결과를 합쳐 앨범·장르·커버 제안과 신뢰도를 정한다."""
+    cands = [c for c in (g.get("dz"), g.get("mb")) if c]
+    out = {"album": None, "genre": None, "covers": [], "cover_level": None, "sources": [c["source"] for c in cands]}
+    if not cands:
+        return out
+    # 앨범명(빈 경우에만 사용): 두 출처가 같으면 확실, 다르면 점수 높은 쪽
+    if len(cands) == 2 and similarity(cands[0]["album"], cands[1]["album"]) >= 0.9:
+        out["album"] = cands[0]["album"]
+    else:
+        out["album"] = max(cands, key=lambda c: c["score"])["album"]
+    # 장르: 라이브러리에 있는 장르로만
+    genre_cands = list(g.get("dz_genres") or []) + list((g.get("mb") or {}).get("genres") or [])
+    out["genre"] = map_genre(genre_cands, library_genres)
+    # 커버: 두 출처 이미지가 같은 그림이면 '높음', 하나뿐이면 앨범 단위로 정확히 찾았을 때만 '높음'
+    covers = [c for c in (g.get("dz_cover"), g.get("mb_cover")) if c]
+    if len(covers) == 2:
+        if same_picture(covers[0]["hash"], covers[1]["hash"]):
+            big = max(covers, key=lambda c: c["size"][0])
+            out["covers"], out["cover_level"] = [big], "높음"
+        else:
+            covers.sort(key=lambda c: -next(x["score"] for x in cands if x["source"] == c["source"]))
+            out["covers"], out["cover_level"] = covers, "출처 불일치"
+    elif covers:
+        src = next(x for x in cands if x["source"] == covers[0]["source"])
+        strong = src["kind"] == "album" and src["score"] >= 0.95
+        out["covers"], out["cover_level"] = covers, ("높음" if strong else "확인 필요")
+    return out
+
+
+def group_sugs(sugs):
     groups = {}
     for s in sugs:
         if not s["missing"] or not s["final_title"]:
             continue
         album = s["changes"].get("album", (None, None))[1] or s.get("raw_album") or ""
-        key = (f"rg|{norm(s['final_artist'])}|{norm(album)}" if album
-               else f"rec|{norm(s['final_artist'])}|{norm(s['final_title'])}")
-        groups.setdefault(key, {"album": album, "members": []})["members"].append(s)
-    order = sorted(groups.items(), key=lambda kv: not any("cover" in m["missing"] for m in kv[1]["members"]))
-    total = len(order)
-    covers = {}
-    now = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for n, (key, g) in enumerate(order, 1):
-            if stop and stop.is_set():
-                break
-            hit = cache.get(key)
-            if hit is not None and (hit.get("found") or now - hit.get("t", 0) < CACHE_MISS_DAYS * 86400):
-                info = hit.get("info")
+        key = (f"album|{norm(s['final_artist'])}|{norm(album)}" if album
+               else f"track|{norm(s['final_artist'])}|{norm(s['final_title'])}")
+        g = groups.setdefault(key, {"key": key, "album": album, "members": []})
+        g["members"].append(s)
+    # 커버가 없는 곡이 있는 그룹부터
+    return sorted(groups.values(), key=lambda g: not any("cover" in m["missing"] for m in g["members"]))
+
+
+def apply_group(g, library_genres):
+    d = decide_group(g, library_genres)
+    for m in g["members"]:
+        m["online"] = d
+        m["matched"] = bool(d["sources"])
+        if "album" in m["missing"] and d["album"]:
+            m["changes"]["album"] = ("", d["album"])
+        if "genre" in m["missing"]:
+            if d["genre"]:
+                m["changes"]["genre"] = ("", d["genre"])
             else:
+                m["changes"].pop("genre", None)
+        if "cover" in m["missing"] and d["covers"]:
+            m["cover_options"] = d["covers"]
+            m["cover_level"] = d["cover_level"]
+            idx = min(m.get("cover_choice", 0), len(d["covers"]) - 1)
+            m["cover_choice"] = idx
+            m["cover"] = (d["covers"][idx]["data"], d["covers"][idx]["mime"])
+
+
+CACHE_MISS_DAYS = 14
+
+
+def _cached(cache, key, fn):
+    hit = cache.get(key)
+    if hit is not None and (hit.get("found") or time.time() - hit.get("t", 0) < CACHE_MISS_DAYS * 86400):
+        return hit.get("info")
+    info = fn()  # 네트워크 오류는 예외로 올라가 캐시되지 않는다
+    cache[key] = {"found": bool(info), "info": info, "t": time.time()}
+    return info
+
+
+def online_fill(sugs, http, cache, library_genres, progress=None, stop=None, workers=6, on_update=None):
+    """빈 앨범·장르·없는 커버를 채운다.
+    1단계 Deezer(빠름) → 2단계 MusicBrainz(초당 1회, 교차 확인). 앨범 태그가 있으면 앨범마다 한 번만 찾는다.
+    커버는 병렬로 내려받고, 두 출처의 커버가 같은 그림인지 비교해 신뢰도를 정한다."""
+    from concurrent.futures import ThreadPoolExecutor
+    groups = group_sugs(sugs)
+    total = len(groups) * 2
+    done = 0
+
+    def tick():
+        nonlocal done
+        done += 1
+        if progress:
+            progress(done, total, "Deezer" if done <= len(groups) else "MusicBrainz")
+
+    def needs_cover(g):
+        return any("cover" in m["missing"] for m in g["members"])
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = []
+
+        def settle(block=False):
+            for item in list(pending):
+                g, slot, fut = item
+                if block or fut.done():
+                    try:
+                        g[slot] = fut.result()
+                    except Exception:
+                        g[slot] = None
+                    pending.remove(item)
+                    apply_group(g, library_genres)
+            if on_update:
+                on_update()
+
+        for source in ("dz", "mb"):
+            for g in groups:
+                if stop and stop.is_set():
+                    break
                 first = g["members"][0]
+                art, title, length = first["final_artist"], first["final_title"], first["length"]
                 try:
-                    if g["album"]:
-                        info = _lookup_album(http, first["final_artist"], g["album"])
+                    if source == "dz":
+                        if g["album"]:
+                            info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_album(http, art, g["album"]))
+                        else:
+                            info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_track(http, title, art, length))
+                        if info and any("genre" in m["missing"] for m in g["members"]) and library_genres:
+                            g["dz_genres"] = _cached(cache, f"dzg|{info.get('album_id')}",
+                                                     lambda: dz_genre_names(http, info.get("album_id"),
+                                                                            info.get("genre_id"))) or []
                     else:
-                        info = _lookup_track(http, first["final_title"], first["final_artist"], first["length"])
+                        if g["album"]:
+                            info = _cached(cache, "mb|" + g["key"], lambda: mb_lookup_album(http, art, g["album"]))
+                        else:
+                            info = _cached(cache, "mb|" + g["key"],
+                                           lambda: mb_lookup_track(http, title, art, length))
                 except Exception as e:
                     first["error"] = str(e)
                     info = None
-                    if progress:
-                        progress(n, total)
-                    continue  # 네트워크 오류는 캐시하지 않는다
-                cache[key] = {"found": bool(info), "info": info, "t": now}
-            if info:
-                for m in g["members"]:
-                    m["matched"], m["confidence"] = True, info["conf"]
-                    if "album" in m["missing"] and info["album"] and "album" not in m["changes"]:
-                        m["changes"]["album"] = ("", info["album"])
-                    if "genre" in m["missing"] and info["genre"]:
-                        m["changes"]["genre"] = ("", info["genre"])
-                    if "cover" in m["missing"] and info.get("rgid"):
-                        rgid = info["rgid"]
-                        if rgid not in covers:
-                            covers[rgid] = pool.submit(fetch_rg_cover, http, rgid, info.get("releases") or [])
-                        m["cover_future"] = covers[rgid]
-            if progress:
-                progress(n, total)
-    for s in sugs:
-        fut = s.pop("cover_future", None)
-        if fut is not None:
-            try:
-                s["cover"] = fut.result()
-            except Exception:
-                s["cover"] = None
-    return total
+                g[source] = info
+                if info and needs_cover(g):
+                    pending.append((g, source + "_cover", pool.submit(download_cover, http, info)))
+                apply_group(g, library_genres)
+                tick()
+                settle()
+        settle(block=True)
+    return len(groups)
 
 
-def count_online_lookups(sugs):
-    keys = set()
-    for s in sugs:
-        if s["missing"] and s["final_title"]:
-            album = s["changes"].get("album", (None, None))[1] or s.get("raw_album") or ""
-            keys.add((norm(s["final_artist"]), norm(album) if album else norm(s["final_title"]), bool(album)))
-    return len(keys)
+def count_online_groups(sugs):
+    return len(group_sugs(sugs))
+
+
+def set_cover_choice(sug, idx):
+    opts = sug.get("cover_options") or []
+    if 0 <= idx < len(opts):
+        sug["cover_choice"] = idx
+        sug["cover"] = (opts[idx]["data"], opts[idx]["mime"])
 
 
 def has_anything(sug, fmt=None, use_name=True):

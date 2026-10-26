@@ -569,103 +569,119 @@ BACKUP_FILE = DATA_DIR / "tag_backup.json"
 
 
 class TagFixWindow(ctk.CTkToplevel):
-    """라이브러리 안에서 표기 차이·깨진 글자·빈 태그·파일명 형식을 점검해 수정안을 보여 주고,
-    체크한 항목만 일괄 적용한다. 빈 앨범·장르·커버는 원할 때만 온라인에서 찾는다."""
+    """라이브러리 안의 표기 차이·깨진 글자·빈 태그·파일명 형식을 점검하고, 빈 커버·앨범·장르는
+    Deezer와 MusicBrainz에서 찾아 교차 확인한다. 바뀌는 내용은 종류별 열로 보여 주고 칸마다 뺄 수 있다."""
+
+    KINDS = ("title", "artist", "album", "genre", "cover", "name")
+    KIND_LABEL = {"title": "제목", "artist": "아티스트", "album": "앨범", "genre": "장르", "cover": "커버",
+                  "name": "파일명"}
 
     def __init__(self, app, paths, scope):
         super().__init__(app)
         self.app = app
         self.paths = paths
         self.title("태그 정리")
-        self.geometry("1080x720")
-        self.minsize(880, 580)
+        self.geometry("1360x780")
+        self.minsize(1000, 600)
         self.transient(app)
         self.font = app.font
 
-        self.sugs = []          # tf.analyze_local 결과 전체
-        self.checked = set()    # sugs 인덱스
-        self.phase = "idle"     # idle | local | online | done | applying
+        self.sugs = []
+        self.override = {}      # (행 번호, 종류) → True(적용) / False(제외). 사용자가 직접 바꾼 칸만 기록
+        self.lib_info = {}
+        self.phase = "idle"     # idle | running | done | applying
         self.stop_flag = threading.Event()
-        self.progress = {"done": 0, "total": 0, "stage": ""}
-        self._preview = None
-        self._pool = None
+        self.progress = {"done": 0, "total": 0, "stage": "", "source": ""}
+        self._imgs = []
+        self._last_refresh = 0.0
+        self._rows_built = False
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         head = ctk.CTkFrame(self, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="태그 정리", font=self.font(22, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
         self.status = ctk.CTkLabel(
             head, anchor="w", justify="left", font=self.font(12), text_color=("#555555", "#a8a8a8"),
             text=f"대상: {scope} {len(paths)}곡\n"
-                 "같은 아티스트·앨범이 다르게 저장된 곡, 깨진 글자, 빈 태그, 파일명 형식을 내 라이브러리 안에서 점검합니다. "
-                 "'적용'을 누르기 전에는 아무것도 바뀌지 않습니다.")
+                 "내 라이브러리 안에서 같은 아티스트·앨범의 다른 표기, 깨진 글자, 빈 태그, 파일명 형식을 점검하고, "
+                 "빈 커버·앨범·장르는 Deezer와 MusicBrainz에서 찾아 서로 대조합니다. '적용'을 누르기 전에는 아무것도 바뀌지 않습니다.")
         self.status.grid(row=1, column=0, sticky="w", pady=(2, 6))
         self.bar = ctk.CTkProgressBar(head, height=8)
         self.bar.set(0)
         self.bar.grid(row=2, column=0, sticky="ew")
-        self.start_btn = ctk.CTkButton(head, text="검사 시작", width=110, height=34, corner_radius=17,
+        self.start_btn = ctk.CTkButton(head, text="검사 시작", width=120, height=34, corner_radius=17,
                                        font=self.font(13, "bold"), command=self.start_or_stop)
         self.start_btn.grid(row=0, column=1, rowspan=2, padx=(12, 0))
 
         opts = ctk.CTkFrame(self, fg_color="transparent")
-        opts.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 4))
-        self.opt_info = ctk.BooleanVar(value=True)
-        self.opt_genre = ctk.BooleanVar(value=True)
-        self.opt_cover = ctk.BooleanVar(value=True)
-        self.opt_name = ctk.BooleanVar(value=True)
-        self.opt_online = ctk.BooleanVar(value=True)
-        for text, var in (("제목·아티스트·앨범", self.opt_info), ("장르", self.opt_genre),
-                          ("커버", self.opt_cover), ("파일명", self.opt_name)):
-            ctk.CTkCheckBox(opts, text=text, variable=var, font=self.font(12),
-                            command=self.refresh_rows).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(opts, text="파일명 형식", font=self.font(12)).pack(side="left", padx=(8, 6))
+        opts.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 2))
+        ctk.CTkLabel(opts, text="파일명 형식", font=self.font(12)).pack(side="left", padx=(0, 6))
         fmt = app.data.get("name_format", "title_artist")
         self.fmt_labels = {v: k for k, v in tf.NAME_FORMATS.items()}
         self.fmt_menu = ctk.CTkOptionMenu(opts, values=list(tf.NAME_FORMATS.values()), width=130, height=28,
                                           font=self.font(12), command=self.on_format)
         self.fmt_menu.set(tf.NAME_FORMATS.get(fmt, "제목_아티스트"))
         self.fmt_menu.pack(side="left")
-        self.online_chk = ctk.CTkCheckBox(opts, text="빈 커버·앨범·장르를 온라인에서 찾기",
+        self.opt_online = ctk.BooleanVar(value=True)
+        self.online_chk = ctk.CTkCheckBox(opts, text="빈 커버·앨범·장르를 온라인에서 찾기 (Deezer + MusicBrainz)",
                                           variable=self.opt_online, font=self.font(12))
         self.online_chk.pack(side="left", padx=(18, 0))
+        ctk.CTkLabel(opts, text="장르는 내 라이브러리에 이미 있는 장르 안에서만 제안합니다.", font=self.font(11),
+                     text_color=("#777777", "#8a8a8a")).pack(side="left", padx=(14, 0))
+
+        # 종류별 요약: 체크하면 그 종류 전체 적용/제외
+        summary = ctk.CTkFrame(self, corner_radius=10)
+        summary.grid(row=2, column=0, sticky="ew", padx=20, pady=(6, 4))
+        ctk.CTkLabel(summary, text="종류별 적용", font=self.font(12, "bold")).pack(side="left", padx=(12, 10), pady=8)
+        self.kind_vars, self.kind_boxes = {}, {}
+        for k in self.KINDS:
+            var = ctk.BooleanVar(value=True)
+            box = ctk.CTkCheckBox(summary, text=self.KIND_LABEL[k], variable=var, font=self.font(12),
+                                  command=lambda k=k: self.toggle_kind(k))
+            box.pack(side="left", padx=(0, 16))
+            self.kind_vars[k], self.kind_boxes[k] = var, box
 
         mid = ctk.CTkFrame(self, fg_color="transparent")
-        mid.grid(row=2, column=0, sticky="nsew", padx=20, pady=4)
+        mid.grid(row=3, column=0, sticky="nsew", padx=20, pady=4)
         mid.grid_columnconfigure(0, weight=1)
         mid.grid_rowconfigure(0, weight=1)
-        cols = ("chk", "file", "summary", "why")
+        cols = ("chk", "file") + self.KINDS
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", style="Music.Treeview", selectmode="browse")
-        for c, text, w, stretch in (("chk", "", 40, False), ("file", "파일", 230, False),
-                                    ("summary", "바뀌는 내용", 600, True), ("why", "이유", 130, False)):
-            self.tree.heading(c, text=text, anchor="center" if c == "chk" else "w")
-            self.tree.column(c, width=w, minwidth=40, stretch=stretch, anchor="center" if c == "chk" else "w")
+        widths = {"chk": 36, "file": 210, "title": 150, "artist": 160, "album": 170, "genre": 110, "cover": 150,
+                  "name": 230}
+        for c in cols:
+            self.tree.heading(c, text={"chk": "", "file": "파일"}.get(c, self.KIND_LABEL.get(c, "")),
+                              anchor="center" if c == "chk" else "w")
+            self.tree.column(c, width=widths[c], minwidth=36, stretch=c not in ("chk",),
+                             anchor="center" if c == "chk" else "w")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        sb = ctk.CTkScrollbar(mid, command=self.tree.yview)
-        sb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
-        self.tree.configure(yscrollcommand=sb.set)
+        ysb = ctk.CTkScrollbar(mid, command=self.tree.yview)
+        ysb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        xsb = ctk.CTkScrollbar(mid, orientation="horizontal", command=self.tree.xview)
+        xsb.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
         self.tree.bind("<Button-1>", self.on_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
-        self.tree.bind("<space>", lambda e: self.toggle_selected())
 
         detail = ctk.CTkFrame(self, corner_radius=12)
-        detail.grid(row=3, column=0, sticky="ew", padx=20, pady=6)
+        detail.grid(row=4, column=0, sticky="ew", padx=20, pady=6)
         detail.grid_columnconfigure(1, weight=1)
-        self.cover_lbl = ctk.CTkLabel(detail, text="", width=110, height=110)
-        self.cover_lbl.grid(row=0, column=0, padx=12, pady=12)
-        self.detail_lbl = ctk.CTkLabel(detail, text="목록에서 곡을 선택하면 자세한 내용이 보입니다.",
-                                       font=self.font(12), anchor="nw", justify="left", wraplength=840)
-        self.detail_lbl.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=12)
+        self.cover_box = ctk.CTkFrame(detail, fg_color="transparent")
+        self.cover_box.grid(row=0, column=0, padx=10, pady=10, sticky="n")
+        self.detail_lbl = ctk.CTkLabel(detail, text="칸을 클릭하면 그 항목만 적용/제외됩니다. 행을 선택하면 근거와 커버 후보가 보입니다.",
+                                       font=self.font(12), anchor="nw", justify="left", wraplength=900)
+        self.detail_lbl.grid(row=0, column=1, sticky="nsew", padx=(4, 12), pady=12)
 
         foot = ctk.CTkFrame(self, fg_color="transparent")
-        foot.grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 16))
+        foot.grid(row=5, column=0, sticky="ew", padx=20, pady=(4, 16))
         small = dict(height=34, corner_radius=17, font=self.font(12), fg_color="transparent", border_width=1,
                      border_color=("#b5b5b5", "#3a3a3a"), hover_color=("#e2e2e2", "#232323"),
                      text_color=("#1a1a1a", "#e8e8e8"))
-        ctk.CTkButton(foot, text="모두 선택", width=90, command=lambda: self.check_all(True), **small).pack(side="left")
-        ctk.CTkButton(foot, text="모두 해제", width=90, command=lambda: self.check_all(False),
+        ctk.CTkButton(foot, text="모두 적용", width=90, command=lambda: self.set_all(True), **small).pack(side="left")
+        ctk.CTkButton(foot, text="모두 제외", width=90, command=lambda: self.set_all(False),
                       **small).pack(side="left", padx=8)
         self.undo_btn = ctk.CTkButton(foot, text="마지막 정리 되돌리기", width=150, command=self.undo_last, **small)
         self.undo_btn.pack(side="left", padx=(16, 0))
@@ -678,7 +694,7 @@ class TagFixWindow(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self.focus)
 
-    # ───── 옵션 ─────
+    # ───── 칸 상태 ─────
     def fmt(self):
         return self.fmt_labels.get(self.fmt_menu.get(), "title_artist")
 
@@ -687,34 +703,62 @@ class TagFixWindow(ctk.CTkToplevel):
         save_data(self.app.data)
         self.refresh_rows()
 
-    def _opts(self):
-        fields = []
-        if self.opt_info.get():
-            fields += ["title", "artist", "album"]
-        if self.opt_genre.get():
-            fields.append("genre")
-        return dict(use_fields=tuple(fields), use_cover=self.opt_cover.get(), use_name=self.opt_name.get())
+    def cell_value(self, i, kind):
+        """그 칸에 제안된 내용(없으면 None)."""
+        s = self.sugs[i]
+        if kind in ("title", "artist", "album", "genre"):
+            return s["changes"].get(kind)
+        if kind == "cover":
+            return s.get("cover")
+        return tf.filename_for(s, self.fmt())
 
-    def _effective(self, sug):
-        """옵션을 반영한 실제 적용 내용."""
-        o = self._opts()
-        return {"changes": {f: v for f, v in sug["changes"].items() if f in o["use_fields"]},
-                "cover": sug["cover"] if o["use_cover"] else None,
-                "new_name": tf.filename_for(sug, self.fmt()) if o["use_name"] else None}
+    def included(self, i, kind):
+        key = (i, kind)
+        if key in self.override:
+            return self.override[key]
+        if kind == "cover":  # 확실하지 않은 커버는 기본으로 빼 둔다
+            return self.sugs[i].get("cover_level") == "높음"
+        return True
 
-    def _has(self, i):
-        e = self._effective(self.sugs[i])
-        return bool(e["changes"] or e["cover"] or e["new_name"])
+    def cell_text(self, i, kind):
+        v = self.cell_value(i, kind)
+        if not v:
+            return ""
+        s = self.sugs[i]
+        if kind == "cover":
+            n = len(s.get("cover_options") or [])
+            text = f"추가 · {s.get('cover_level', '')}" + (f" · 후보 {n}개" if n > 1 else "")
+        elif kind == "name":
+            text = v
+        else:
+            old, new = v
+            text = f"{old} → {new}" if old else f"+ {new}"
+        return text if self.included(i, kind) else f"[제외] {text}"
+
+    def row_kinds(self, i):
+        return [k for k in self.KINDS if self.cell_value(i, k)]
+
+    def row_mark(self, i):
+        ks = self.row_kinds(i)
+        on = sum(self.included(i, k) for k in ks)
+        return "▣" if on == len(ks) else ("▤" if on else "□")
+
+    def effective(self, i):
+        s = self.sugs[i]
+        changes = {k: v for k, v in s["changes"].items() if self.included(i, k)}
+        cover = s.get("cover") if s.get("cover") and self.included(i, "cover") else None
+        name = tf.filename_for(s, self.fmt()) if self.included(i, "name") else None
+        return {**s, "changes": changes, "cover": cover, "new_name": name}
 
     # ───── 검사 ─────
     def start_or_stop(self):
-        if self.phase in ("local", "online"):
+        if self.phase == "running":
             self.stop_flag.set()
-            self.start_btn.configure(state="disabled", text="중지 중…")
+            self.start_btn.configure(state="disabled", text="정리 중…")
             return
         if self.phase != "idle":
             return
-        self.phase = "local"
+        self.phase = "running"
         self.start_btn.configure(text="중지")
         self.undo_btn.configure(state="disabled")
         self.online_chk.configure(state="disabled")
@@ -725,30 +769,27 @@ class TagFixWindow(ctk.CTkToplevel):
             pr = self.progress
             pr["stage"] = "local"
 
-            def prog(done, total):
+            def lprog(done, total):
                 pr["done"], pr["total"] = done, total
 
             try:
-                sugs = tf.analyze_local(self.paths, library, fmt, progress=prog)
+                self.sugs = tf.analyze_local(self.paths, library, fmt, progress=lprog, info=self.lib_info)
             except Exception as e:
-                sugs = []
-                pr["error"] = str(e)
-            self.sugs = sugs
+                self.sugs, pr["error"] = [], str(e)
             pr["stage"] = "local_done"
-            if not online or self.stop_flag.is_set():
-                pr["stage"] = "finished"
-                return
-            pr["stage"], pr["done"], pr["total"] = "online", 0, tf.count_online_lookups(sugs)
-            cache = load_online_cache()
+            if online and not self.stop_flag.is_set():
+                pr["stage"], pr["done"], pr["total"] = "online", 0, tf.count_online_groups(self.sugs) * 2
+                cache = load_online_cache()
 
-            def oprog(done, total):
-                pr["done"], pr["total"] = done, total
+                def oprog(done, total, source):
+                    pr["done"], pr["total"], pr["source"] = done, total, source
 
-            try:
-                tf.online_fill(sugs, tf.Http(), cache, progress=oprog, stop=self.stop_flag)
-            except Exception as e:
-                pr["error"] = str(e)
-            save_online_cache(cache)
+                try:
+                    tf.online_fill(self.sugs, tf.Http(), cache, self.lib_info.get("genres", {}),
+                                   progress=oprog, stop=self.stop_flag)
+                except Exception as e:
+                    pr["error"] = str(e)
+                save_online_cache(cache)
             pr["stage"] = "finished"
 
         threading.Thread(target=worker, daemon=True).start()
@@ -759,23 +800,22 @@ class TagFixWindow(ctk.CTkToplevel):
             return
         pr = self.progress
         stage = pr["stage"]
-        if stage in ("local_done", "online", "finished") and not self.tree.get_children() and self.sugs \
-                and not getattr(self, "_rows_built", False):
-            self.checked = set(range(len(self.sugs)))
+        if stage in ("local_done", "online", "finished") and not self._rows_built:
             self._rows_built = True
             self.refresh_rows()
-            if stage != "finished":
-                self.phase = "online"
-        total = max(pr["total"], 1)
-        self.bar.set(pr["done"] / total)
+        self.bar.set(pr["done"] / max(pr["total"], 1))
         if stage in ("", "local"):
             self.status.configure(text=f"태그 읽는 중… {pr['done']} / {pr['total']}")
         elif stage == "online":
-            left = (pr["total"] - pr["done"]) * 1.15
-            eta = f"{int(left // 60)}분 {int(left % 60)}초" if left >= 60 else f"{int(left)}초"
-            self.status.configure(text=f"온라인 검색 중… 앨범 {pr['done']} / {pr['total']}개 · 최대 약 {eta} 남음"
-                                       " (이전에 찾은 앨범은 바로 넘어갑니다) · 중지하면 지금까지 찾은 결과로 적용할 수 있습니다.")
-            if time.monotonic() - getattr(self, "_last_refresh", 0) > 2:
+            half = pr["total"] // 2
+            if pr["source"] == "MusicBrainz" or pr["done"] > half:
+                left = (pr["total"] - pr["done"]) * 1.15
+                eta = f"{int(left // 60)}분 {int(left % 60)}초" if left >= 60 else f"{int(left)}초"
+                self.status.configure(text=f"MusicBrainz로 교차 확인 중… {pr['done'] - half} / {half} · 최대 약 {eta} 남음. "
+                                           "'중지'를 누르면 지금까지 결과로 적용할 수 있습니다(Deezer 결과는 이미 반영됨).")
+            else:
+                self.status.configure(text=f"Deezer에서 찾는 중… {pr['done']} / {half}")
+            if time.monotonic() - self._last_refresh > 2:
                 self._last_refresh = time.monotonic()
                 self.refresh_rows()
         if stage != "finished":
@@ -783,115 +823,144 @@ class TagFixWindow(ctk.CTkToplevel):
             return
         self.phase = "done"
         self.refresh_rows()
-        n = sum(1 for i in range(len(self.sugs)) if self._has(i))
+        n = sum(1 for i in range(len(self.sugs)) if self.row_kinds(i))
         stopped = " (중지됨)" if self.stop_flag.is_set() else ""
         err = f" · 오류: {pr['error']}" if pr.get("error") else ""
         self.status.configure(text=f"검사 끝{stopped}: {len(self.sugs)}곡 중 {n}곡에 수정안이 있습니다{err}. "
-                                   "행을 클릭하면 이유와 자세한 내용이 보이고, ▣를 누르면 뺄 수 있습니다.")
+                                   "칸을 클릭하면 그 항목만 빼거나 넣을 수 있고, 확실하지 않은 커버는 [제외] 상태로 둡니다.")
         self.bar.set(1)
         self.start_btn.configure(text="검사 완료", state="disabled")
         self.undo_btn.configure(state="normal" if BACKUP_FILE.exists() else "disabled")
-        self.update_apply_btn()
+        self.update_counts()
 
-    # ───── 목록 ─────
-    def _why(self, sug, eff):
-        reasons = []
-        notes = " ".join(sug["notes"])
-        if "다른 표기" in notes:
-            reasons.append("표기 통일")
-        if "깨진 글자" in notes:
-            reasons.append("깨진 글자")
-        if "파일명에서 가져옴" in notes:
-            reasons.append("빈 태그")
-        if sug["matched"] and (eff["cover"] or any(f in eff["changes"] for f in ("album", "genre"))
-                               and eff["changes"].get("album", ("x",))[0] == ""):
-            reasons.append("온라인")
-        if eff["new_name"] and not reasons:
-            reasons.append("파일명 형식")
-        return ", ".join(reasons)
-
+    # ───── 표 ─────
     def refresh_rows(self):
         sel = self.tree.selection()
         top = self.tree.yview()[0]
         self.tree.delete(*self.tree.get_children())
-        for i, sug in enumerate(self.sugs):
-            if not self._has(i):
+        for i, s in enumerate(self.sugs):
+            if not self.row_kinds(i):
                 continue
-            eff = self._effective(sug)
-            text = tf.summarize({**sug, "changes": eff["changes"], "cover": eff["cover"]}, self.fmt(),
-                                use_name=bool(eff["new_name"]))
-            self.tree.insert("", "end", iid=str(i), values=("▣" if i in self.checked else "□",
-                                                            Path(sug["path"]).name, text, self._why(sug, eff)))
+            self.tree.insert("", "end", iid=str(i), values=(self.row_mark(i), Path(s["path"]).name)
+                             + tuple(self.cell_text(i, k) for k in self.KINDS))
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
         self.tree.yview_moveto(top)
-        self.update_apply_btn()
+        self.update_counts()
 
-    def update_apply_btn(self):
-        n = sum(1 for i in self.checked if i < len(self.sugs) and self._has(i))
+    def update_row(self, i):
+        if self.tree.exists(str(i)):
+            self.tree.item(str(i), values=(self.row_mark(i), Path(self.sugs[i]["path"]).name)
+                           + tuple(self.cell_text(i, k) for k in self.KINDS))
+
+    def update_counts(self):
+        rows = [i for i in range(len(self.sugs)) if self.row_kinds(i)]
+        for k in self.KINDS:
+            have = [i for i in rows if self.cell_value(i, k)]
+            on = sum(self.included(i, k) for i in have)
+            self.kind_boxes[k].configure(text=f"{self.KIND_LABEL[k]} {on}/{len(have)}",
+                                         state="normal" if have else "disabled")
+            if on == len(have) and have:
+                self.kind_boxes[k].select()
+            else:
+                self.kind_boxes[k].deselect()
+        n = sum(1 for i in rows if any(self.included(i, k) for k in self.row_kinds(i)))
         ok = n > 0 and self.phase == "done"
         self.apply_btn.configure(text=f"적용 ({n}곡)", state="normal" if ok else "disabled")
 
-    def on_click(self, event):
-        if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_column(event.x) == "#1":
-            row = self.tree.identify_row(event.y)
-            if row:
-                self.toggle(int(row))
-                return "break"
-
-    def toggle(self, i):
-        (self.checked.discard if i in self.checked else self.checked.add)(i)
-        vals = list(self.tree.item(str(i), "values"))
-        vals[0] = "▣" if i in self.checked else "□"
-        self.tree.item(str(i), values=vals)
-        self.update_apply_btn()
-
-    def toggle_selected(self):
-        sel = self.tree.selection()
-        if sel:
-            self.toggle(int(sel[0]))
-
-    def check_all(self, on):
-        self.checked = set(range(len(self.sugs))) if on else set()
+    def toggle_kind(self, kind):
+        on = self.kind_vars[kind].get()
+        for i in range(len(self.sugs)):
+            if self.cell_value(i, kind):
+                self.override[(i, kind)] = on
         self.refresh_rows()
+
+    def set_all(self, on):
+        for i in range(len(self.sugs)):
+            for k in self.row_kinds(i):
+                self.override[(i, k)] = on
+        self.refresh_rows()
+
+    def on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        i = int(row)
+        col = int(self.tree.identify_column(event.x)[1:]) - 1
+        name = (("chk", "file") + self.KINDS)[col]
+        if name == "chk":
+            ks = self.row_kinds(i)
+            target = not all(self.included(i, k) for k in ks)
+            for k in ks:
+                self.override[(i, k)] = target
+        elif name in self.KINDS and self.cell_value(i, name):
+            self.override[(i, name)] = not self.included(i, name)
+        else:
+            return
+        self.update_row(i)
+        self.update_counts()
+        self.tree.selection_set(row)
+        self.on_select()
+        return "break"
 
     def on_select(self, _=None):
         sel = self.tree.selection()
+        for w in self.cover_box.winfo_children():
+            w.destroy()
+        self._imgs = []
         if not sel:
             return
-        sug = self.sugs[int(sel[0])]
-        eff = self._effective(sug)
-        lines = [f"파일: {sug['path']}"]
-        for f, (old, new) in eff["changes"].items():
-            lines.append(f"{tf.FIELD_LABEL[f]}:  {old or '(없음)'}  →  {new}")
-        if eff["new_name"]:
-            lines.append(f"파일명:  {Path(sug['path']).name}  →  {eff['new_name']}")
-        if eff["cover"]:
-            lines.append("커버:  없음  →  왼쪽 이미지 추가")
-        for note in sug["notes"]:
-            lines.append(f"· {note}")
-        if sug["matched"]:
-            lines.append(f"· 온라인(MusicBrainz) 일치도 {int(sug['confidence'] * 100)}%")
+        i = int(sel[0])
+        s = self.sugs[i]
+        lines = [f"파일: {s['path']}"]
+        for k in self.KINDS:
+            t = self.cell_text(i, k)
+            if t:
+                lines.append(f"{self.KIND_LABEL[k]}:  {t}")
+        lines += [f"· {n}" for n in s["notes"]]
+        on = s.get("online") or {}
+        if on.get("sources"):
+            lines.append("· 온라인 출처: " + ", ".join(on["sources"]))
+        if s.get("cover_level") == "출처 불일치":
+            lines.append("· 두 출처의 커버가 서로 다릅니다. 왼쪽에서 맞는 것을 고르세요.")
+        elif s.get("cover_level") == "확인 필요":
+            lines.append("· 한 출처에서만 찾은 커버입니다. 맞으면 커버 칸을 클릭해 적용하세요.")
+        if "genre" in s["missing"] and "genre" not in s["changes"] and on.get("sources"):
+            lines.append("· 온라인 장르가 내 라이브러리의 기존 장르와 맞지 않아 장르는 제안하지 않았습니다.")
         self.detail_lbl.configure(text="\n".join(lines))
-        if eff["cover"]:
+        for j, opt in enumerate(s.get("cover_options") or []):
             try:
-                img = Image.open(BytesIO(eff["cover"][0]))
-                self._preview = ctk.CTkImage(rounded(img, 220, 16), size=(110, 110))
-                self.cover_lbl.configure(image=self._preview)
-                return
+                img = Image.open(BytesIO(opt["data"]))
             except Exception:
-                pass
-        self.cover_lbl.configure(image=None)
-        self._preview = None
+                continue
+            chosen = j == s.get("cover_choice", 0)
+            cimg = ctk.CTkImage(rounded(img, 200, 14), size=(100, 100))
+            self._imgs.append(cimg)
+            ctk.CTkButton(self.cover_box, image=cimg, text=f"{opt['source']} {opt['size'][0]}px" + (" (선택)" if chosen else ""),
+                          compound="top", width=110, height=130, corner_radius=10, font=self.font(11),
+                          fg_color=(ACCENT if chosen else "transparent"), border_width=1,
+                          border_color=("#b5b5b5", "#3a3a3a"), hover_color=("#e2e2e2", "#232323"),
+                          text_color=("#1a1a1a", "#e8e8e8"),
+                          command=lambda i=i, j=j: self.choose_cover(i, j)).pack(side="left", padx=4)
+
+    def choose_cover(self, i, j):
+        tf.set_cover_choice(self.sugs[i], j)
+        self.override[(i, "cover")] = True
+        self.update_row(i)
+        self.update_counts()
+        self.on_select()
 
     # ───── 적용 ─────
     def apply(self):
         items = []
-        for i in sorted(self.checked):
-            if i >= len(self.sugs) or not self._has(i):
+        for i in range(len(self.sugs)):
+            if not self.row_kinds(i):
                 continue
-            eff = self._effective(self.sugs[i])
-            items.append({**self.sugs[i], **eff})
+            e = self.effective(i)
+            if e["changes"] or e["cover"] or e["new_name"]:
+                items.append(e)
         if not items:
             return
         if not messagebox.askyesno("태그 정리", f"{len(items)}곡의 파일을 수정합니다.\n"
