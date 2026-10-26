@@ -13,7 +13,7 @@ import time
 import traceback
 from pathlib import Path
 
-LAUNCHER_VERSION = 1
+LAUNCHER_VERSION = 2
 DATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer"
 CODE_DIR = DATA_DIR / "code"
 BAD_FILE = CODE_DIR / "bad_versions.json"

@@ -1,5 +1,5 @@
-# music_player.py 또는 requirements.txt가 바뀌어 main 브랜치에 올라오면
-# Windows에서 exe를 빌드해 새 릴리스(v1.0.<실행 번호>)로 올린다.
+# 코드·글꼴·버전 파일이 바뀌어 main 브랜치에 올라오면 Windows에서 exe를 빌드해 새 릴리스로 올린다.
+# 버전: VERSION 파일의 앞자리(예: 1.1) + 그 앞자리로 이미 나온 릴리스 수 → v1.1.0, v1.1.1, ...
 name: Build and Release
 
 on:
@@ -10,6 +10,8 @@ on:
       - "music_player.py"
       - "tag_fixer.py"
       - "requirements.txt"
+      - "VERSION"
+      - "fonts/**"
       - ".github/workflows/build.yml"
   workflow_dispatch:
 
@@ -21,10 +23,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # 기존 태그를 세어 다음 버전 번호를 정하기 위해
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $base = (Get-Content VERSION -Raw).Trim()
+          $n = @(git tag --list "v$base.*").Count
+          "version=$base.$n" >> $env:GITHUB_OUTPUT
 
       - name: Install requirements
         run: python -m pip install -r requirements.txt
@@ -32,11 +44,11 @@ jobs:
       - name: Write app_info.json
         shell: pwsh
         run: |
-          $info = @{ version = "1.0.${{ github.run_number }}"; repo = "${{ github.repository }}" } | ConvertTo-Json -Compress
+          $info = @{ version = "${{ steps.ver.outputs.version }}"; repo = "${{ github.repository }}" } | ConvertTo-Json -Compress
           [System.IO.File]::WriteAllText("app_info.json", $info)
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name MusicPlayer --collect-data customtkinter --add-data "app_info.json;." launcher.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name MusicPlayer --collect-data customtkinter --add-data "app_info.json;." --add-data "fonts;fonts" launcher.py
 
       - name: Zip
         shell: pwsh
@@ -45,4 +57,4 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v1.0.${{ github.run_number }}" MusicPlayer.zip --title "v1.0.${{ github.run_number }}" --notes "Automatic build from ${{ github.sha }}"
+        run: gh release create "v${{ steps.ver.outputs.version }}" MusicPlayer.zip --title "v${{ steps.ver.outputs.version }}" --notes "Automatic build from ${{ github.sha }}"

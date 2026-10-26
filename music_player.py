@@ -36,10 +36,32 @@ APP_NAME = "Music Player"
 DATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer"
 DATA_FILE = DATA_DIR / "data.json"
 UI_FONT = "Malgun Gothic" if sys.platform.startswith("win") else "Helvetica"
+UI_FONT_BOLD = UI_FONT
+FONT_FILES = {  # 프로그램에 넣어 배포하는 글꼴(SIL Open Font License 1.1, fonts/OFL-License.txt)
+    "ResourceHanRoundedKR-Medium.ttf": "Resource Han Rounded KR Medium",  # 본문(중간 굵기)
+    "ResourceHanRoundedKR-Bold.ttf": "Resource Han Rounded KR",           # 제목(굵게)
+}
+
+
+def load_bundled_fonts():
+    """exe 안의 fonts 폴더에 있는 글꼴을 이 프로그램 전용으로 등록한다. 실패하면 맑은 고딕을 쓴다."""
+    global UI_FONT, UI_FONT_BOLD
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "fonts"
+    files = [base / f for f in FONT_FILES]
+    if not all(f.is_file() for f in files):
+        return False
+    try:
+        ok = all(ctk.FontManager.load_font(str(f)) for f in files)
+    except Exception:
+        ok = False
+    if ok:
+        UI_FONT, UI_FONT_BOLD = FONT_FILES["ResourceHanRoundedKR-Medium.ttf"], FONT_FILES["ResourceHanRoundedKR-Bold.ttf"]
+    return ok
 ACCENT = "#FF8000"          # 기본 강조색
 ACCENT_RGB = (255, 128, 0)
 ACCENT_HOVER = "#E06F00"
 ACCENT_DEEP = "#C25F00"
+ON_ACCENT = "#1A1A1A"        # 주황 위에 올리는 글자·아이콘 색
 UNKNOWN_ARTIST = "알 수 없는 아티스트"
 UNKNOWN_ALBUM = "알 수 없는 앨범"
 
@@ -93,7 +115,7 @@ def fetch_latest_release(repo):
 # exe(launcher)는 시작할 때 가장 새 코드를 불러온다.
 CODE_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer" / "code"
 CODE_FILES = ("music_player.py", "tag_fixer.py")
-REQUIRES_LAUNCHER = 1     # 이 코드를 실행하는 데 필요한 launcher 버전(새 라이브러리가 필요해지면 올린다)
+REQUIRES_LAUNCHER = 2     # 이 코드를 실행하는 데 필요한 launcher 버전(2: 글꼴 내장)
 APP_VERSION = None        # launcher가 넣어 준다
 LAUNCHER_VERSION = None   # launcher가 넣어 준다(구버전 exe에서는 None)
 
@@ -401,9 +423,15 @@ def build_theme():
         return x
 
     theme = walk(theme)
-    for widget in ("CTkButton", "CTkOptionMenu", "CTkSegmentedButton"):  # 주황 위 글자는 흰색
+    # 밝은 주황 위의 흰 글자는 대비가 약하고(약 2.9:1) 글자 가장자리가 번져 보여서 어두운 글자를 쓴다
+    for widget in ("CTkButton", "CTkOptionMenu", "CTkSegmentedButton"):
         if widget in theme and "text_color" in theme[widget]:
-            theme[widget]["text_color"] = ["#FFFFFF", "#FFFFFF"]
+            theme[widget]["text_color"] = [ON_ACCENT, ON_ACCENT]
+    if "CTkCheckBox" in theme:
+        theme["CTkCheckBox"]["checkmark_color"] = [ON_ACCENT, ON_ACCENT]
+    for platform in (theme.get("CTkFont") or {}).values():  # 글꼴을 지정하지 않은 위젯도 같은 글꼴로
+        if isinstance(platform, dict):
+            platform["family"] = UI_FONT
     out = DATA_DIR / "theme_orange.json"
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -456,34 +484,34 @@ def rounded(img, size, radius):
 
 
 def make_note(size, color):
-    """둥근 끝을 가진 음표(♪). 8배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
+    """겹음표(♫). 끝을 모두 둥글게 처리하고 8배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
     S = size * 8
-    img = Image.new("L", (S, S), 0)
-    d = ImageDraw.Draw(img)
-    stroke = S * 0.075                       # 기둥·깃발 두께
-    head_cx, head_cy = S * 0.40, S * 0.72    # 음표 머리 중심
-    rx, ry = S * 0.16, S * 0.125
-    # 머리: 살짝 기운 타원
-    head = Image.new("L", (S, S), 0)
-    ImageDraw.Draw(head).ellipse((head_cx - rx, head_cy - ry, head_cx + rx, head_cy + ry), fill=255)
-    head = head.rotate(20, center=(head_cx, head_cy), resample=Image.BICUBIC)
-    img.paste(255, (0, 0), head)
-    # 기둥: 머리 오른쪽 끝에서 위로, 끝은 둥글게
-    sx = head_cx + rx * 0.86
-    top_y = S * 0.16
-    d.rounded_rectangle((sx - stroke, top_y, sx, head_cy - ry * 0.2), radius=stroke / 2, fill=255)
-    # 깃발: 기둥 꼭대기에서 오른쪽 아래로 휘는 곡선을 둥근 붓으로 그린다
-    p0, p1, p2, p3 = (sx - stroke / 2, top_y + stroke / 2), (sx + S * 0.10, top_y + S * 0.08), \
-                     (sx + S * 0.25, top_y + S * 0.12), (sx + S * 0.20, top_y + S * 0.34)
-    rr = stroke / 2
-    for k in range(200):
-        t = k / 199
-        mt = 1 - t
-        x = mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0] + 3 * mt * t * t * p2[0] + t ** 3 * p3[0]
-        y = mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1] + 3 * mt * t * t * p2[1] + t ** 3 * p3[1]
-        w = rr * (1.0 - 0.25 * t)            # 끝으로 갈수록 살짝 가늘게
-        d.ellipse((x - w, y - w, x + w, y + w), fill=255)
-    mask = img.resize((size, size), Image.LANCZOS)
+    m = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(m)
+    w = S * 0.085                                  # 기둥 두께
+    beam = S * 0.13                                # 들보 두께
+    heads = [(S * 0.30, S * 0.76), (S * 0.70, S * 0.68)]   # 음표 머리 중심(오른쪽이 조금 높음)
+    rx, ry = S * 0.135, S * 0.105
+    tops = []
+    for hx, hy in heads:
+        head = Image.new("L", (S, S), 0)
+        ImageDraw.Draw(head).ellipse((hx - rx, hy - ry, hx + rx, hy + ry), fill=255)
+        head = head.rotate(22, center=(hx, hy), resample=Image.BICUBIC)
+        m.paste(255, (0, 0), head)
+        sx = hx + rx * 0.80                        # 기둥은 머리 오른쪽에서 위로
+        tops.append((sx, hy))
+    top_l, top_r = S * 0.20, S * 0.12              # 들보 높이(오른쪽이 높게 기울어짐)
+    for (sx, hy), ty in zip(tops, (top_l, top_r)):
+        d.rounded_rectangle((sx - w, ty + beam * 0.3, sx, hy - ry * 0.3), radius=w / 2, fill=255)
+    # 들보: 두 기둥 꼭대기를 잇는 두꺼운 선, 양 끝은 둥글게
+    (x1, _), (x2, _) = tops
+    p1, p2 = (x1 - w / 2, top_l + beam / 2), (x2 - w / 2, top_r + beam / 2)
+    n = 120
+    for k in range(n + 1):
+        t = k / n
+        cx, cy = p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t
+        d.ellipse((cx - beam / 2, cy - beam / 2, cx + beam / 2, cy + beam / 2), fill=255)
+    mask = m.resize((size, size), Image.LANCZOS)
     out = Image.new("RGBA", (size, size), color)
     out.putalpha(mask)
     return out
@@ -1159,7 +1187,7 @@ class TagFixWindow(ctk.CTkToplevel):
                           compound="top", width=110, height=130, corner_radius=10, font=self.font(11),
                           fg_color=(ACCENT if chosen else "transparent"), border_width=1,
                           border_color=("#b5b5b5", "#3a3a3a"), hover_color=("#e2e2e2", "#232323"),
-                          text_color=("#1a1a1a", "#e8e8e8"),
+                          text_color=(ON_ACCENT, ON_ACCENT) if chosen else ("#1a1a1a", "#e8e8e8"),
                           command=lambda i=i, j=j: self.choose_cover(i, j)).pack(side="left", padx=4)
 
     def choose_cover(self, i, j):
@@ -1358,8 +1386,8 @@ class MusicApp(ctk.CTk):
 
         self.ph_big = ctk.CTkImage(rounded(placeholder(504), 504, 36), size=(252, 252))
         self.ph_small = ctk.CTkImage(rounded(placeholder(112), 112, 14), size=(56, 56))
-        self.ic_play = ctk_icon("play", 22, "#ffffff", "#ffffff")
-        self.ic_pause = ctk_icon("pause", 22, "#ffffff", "#ffffff")
+        self.ic_play = ctk_icon("play", 22, ON_ACCENT, ON_ACCENT)
+        self.ic_pause = ctk_icon("pause", 22, ON_ACCENT, ON_ACCENT)
         self.ic_prev = ctk_icon("prev", 18, "#2b2b2b", "#e6e6e6")
         self.ic_next = ctk_icon("next", 18, "#2b2b2b", "#e6e6e6")
         self.ic_vol = ctk_icon("volume", 18, "#555555", "#b3b3b3")
@@ -1449,6 +1477,8 @@ class MusicApp(ctk.CTk):
         self.on_close()
 
     def font(self, size, weight="normal"):
+        if weight == "bold":  # 굵은 글자는 Bold 글꼴 파일로(가짜 굵게 처리 방지)
+            return ctk.CTkFont(family=UI_FONT_BOLD, size=size, weight="bold")
         return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
 
     # ───── 레이아웃 ─────
@@ -1639,7 +1669,7 @@ class MusicApp(ctk.CTk):
         style.configure("Music.Treeview", background=bg, fieldbackground=bg, foreground=fg,
                         rowheight=int(36 * scale), borderwidth=0, font=(UI_FONT, 10))
         style.configure("Music.Treeview.Heading", background=bg, foreground=sub, borderwidth=0,
-                        relief="flat", font=(UI_FONT, 9, "bold"), padding=(6, 8))
+                        relief="flat", font=(UI_FONT_BOLD, 9, "bold"), padding=(6, 8))
         style.map("Music.Treeview", background=[("selected", sel)], foreground=[("selected", fg)])
         style.map("Music.Treeview.Heading", background=[("active", bg)], foreground=[("active", fg)])
         style.layout("Music.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
@@ -2157,6 +2187,7 @@ def main():
             ulog(f"helper error: {e!r}")
             ctypes_msg(f"업데이트 중 오류가 발생했습니다.\n{e}")
         sys.exit(0)
+    load_bundled_fonts()
     if getattr(sys, "frozen", False):
         t = threading.Timer(15, cleanup_old_updates)  # 지난 방식의 업데이트 임시 폴더 정리
         t.daemon = True
