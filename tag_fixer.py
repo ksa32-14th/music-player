@@ -25,7 +25,7 @@ MB_SEARCH = "https://musicbrainz.org/ws/2/recording"
 CAA = "https://coverartarchive.org"
 MB_INTERVAL = 1.1  # 초. MusicBrainz 제한(초당 1회)보다 약간 여유를 둔다.
 DZ = "https://api.deezer.com"
-DZ_INTERVAL = 0.2  # 초. Deezer는 공식 제한이 명확히 공개되어 있지 않아 초당 5회로 보수적으로 보낸다.
+DZ_INTERVAL = 0.12  # 초. 흔히 알려진 Deezer 제한(5초에 50회)보다 낮은 초당 약 8회. 초과 오류가 오면 쉬었다가 다시 보낸다.
 FIELDS = ("title", "artist", "album", "genre")
 FIELD_LABEL = {"title": "제목", "artist": "아티스트", "album": "앨범", "genre": "장르"}
 TEXT_FRAMES = {"title": TIT2, "artist": TPE1, "album": TALB, "genre": TCON}
@@ -528,8 +528,18 @@ def dz_quote(s):
 _DZ_GENRES = {}
 
 
+_DZ_GENRE_LOCK = __import__("threading").Lock()
+
+
 def dz_genre_names(http, album_id=None, genre_id=None):
     names = []
+    if genre_id and genre_id > 0:
+        with _DZ_GENRE_LOCK:
+            if not _DZ_GENRES:
+                for g in http.dz_json(f"{DZ}/genre").get("data", []):
+                    _DZ_GENRES[g.get("id")] = g.get("name", "")
+        if _DZ_GENRES.get(genre_id):
+            return [_DZ_GENRES[genre_id]]
     if album_id:
         data = http.dz_json(f"{DZ}/album/{album_id}")
         names = [g.get("name", "") for g in (data.get("genres") or {}).get("data", [])]
@@ -546,13 +556,17 @@ def dz_genre_names(http, album_id=None, genre_id=None):
 def dz_lookup_album(http, artist, album):
     q = f"artist:{dz_quote(artist)} album:{dz_quote(album)}"
     items = http.dz_json(f"{DZ}/search/album?{urllib.parse.urlencode({'q': q, 'limit': 10})}").get("data", [])
+    constrained = bool(items)  # Deezer가 아티스트 조건(별칭 포함)으로 찾은 결과
     if not items:  # 한글/영문 표기 차이 등으로 못 찾으면 자유 검색
         items = http.dz_json(f"{DZ}/search/album?{urllib.parse.urlencode({'q': f'{artist} {album}', 'limit': 10})}").get("data", [])
     best, best_s = None, 0.0
     for it in items:
         a_sim = similarity(album, it.get("title", ""))
         art = (it.get("artist") or {}).get("name", "")
-        r_sim = similarity(artist, art) if has_hangul(artist) == has_hangul(art) else 0.6
+        if has_hangul(artist) == has_hangul(art):
+            r_sim = similarity(artist, art)
+        else:  # '아이유'와 'IU'처럼 표기 문자가 다름: 아티스트 조건 검색으로 나온 경우만 같은 아티스트로 인정
+            r_sim = 0.95 if constrained else 0.6
         if a_sim < 0.9 or r_sim < 0.5:
             continue
         sc = 0.7 * a_sim + 0.3 * r_sim
@@ -741,73 +755,119 @@ def _cached(cache, key, fn):
     return info
 
 
-def online_fill(sugs, http, cache, library_genres, progress=None, stop=None, workers=6, on_update=None):
+def needs_mb(g):
+    """Deezer 결과만으로 확정할 수 없어 MusicBrainz 확인이 필요한 그룹인지."""
+    if not g.get("dz"):
+        return True  # Deezer에서 못 찾음
+    members = g["members"]
+    if any("cover" in m["missing"] for m in members):
+        dz = g["dz"]
+        if not g.get("dz_cover"):
+            return True  # 커버를 못 받음
+        if not (dz["kind"] == "album" and dz["score"] >= 0.95):
+            return True  # 곡 단위로 찾았거나 앨범 이름이 정확히 맞지 않음 → 교차 확인
+    return False
+
+
+def online_fill(sugs, http, cache, library_genres, progress=None, stop=None, workers=6, on_update=None,
+                dz_workers=4):
     """빈 앨범·장르·없는 커버를 채운다.
-    1단계 Deezer(빠름) → 2단계 MusicBrainz(초당 1회, 교차 확인). 앨범 태그가 있으면 앨범마다 한 번만 찾는다.
-    커버는 병렬로 내려받고, 두 출처의 커버가 같은 그림인지 비교해 신뢰도를 정한다."""
-    from concurrent.futures import ThreadPoolExecutor
+    1단계: Deezer를 여러 개 동시에 검색(요청 간격은 공유 제한으로 지킴)하고 커버도 병렬로 내려받는다.
+    2단계: Deezer만으로 확정되지 않은 그룹만 MusicBrainz(초당 1회)로 교차 확인한다.
+    앨범 태그가 있으면 앨범마다 한 번만 찾는다."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     groups = group_sugs(sugs)
-    total = len(groups) * 2
-    done = 0
+    state = {"done": 0, "total": len(groups), "phase": "Deezer"}
 
     def tick():
-        nonlocal done
-        done += 1
+        state["done"] += 1
         if progress:
-            progress(done, total, "Deezer" if done <= len(groups) else "MusicBrainz")
+            progress(state["done"], state["total"], state["phase"])
 
     def needs_cover(g):
         return any("cover" in m["missing"] for m in g["members"])
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = []
+    def wants_genre(g):
+        return bool(library_genres) and any("genre" in m["missing"] for m in g["members"])
 
-        def settle(block=False):
-            for item in list(pending):
-                g, slot, fut = item
-                if block or fut.done():
-                    try:
-                        g[slot] = fut.result()
-                    except Exception:
-                        g[slot] = None
-                    pending.remove(item)
-                    apply_group(g, library_genres)
+    def dz_task(g):
+        first = g["members"][0]
+        art, title, length = first["final_artist"], first["final_title"], first["length"]
+        try:
+            if g["album"]:
+                info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_album(http, art, g["album"]))
+            else:
+                info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_track(http, title, art, length))
+            if info and wants_genre(g):
+                try:  # 장르를 못 가져와도 앨범·커버 결과는 살린다
+                    g["dz_genres"] = _cached(cache, f"dzg|{info.get('album_id')}|{info.get('genre_id')}",
+                                             lambda: dz_genre_names(http, info.get("album_id"),
+                                                                    info.get("genre_id"))) or []
+                except Exception:
+                    g["dz_genres"] = []
+            g["dz"] = info
+            if info and needs_cover(g):
+                g["dz_cover"] = download_cover(http, info)
+        except Exception as e:
+            first["error"] = str(e)
+            g["dz"] = None
+        apply_group(g, library_genres)
+        return g
+
+    # 1단계: Deezer (병렬)
+    with ThreadPoolExecutor(max_workers=dz_workers) as pool:
+        futs = []
+        for g in groups:
+            if stop and stop.is_set():
+                break
+            futs.append(pool.submit(dz_task, g))
+        for f in as_completed(futs):
+            f.result()
+            tick()
             if on_update:
                 on_update()
+        if stop and stop.is_set():
+            pool.shutdown(cancel_futures=True)
 
-        for source in ("dz", "mb"):
-            for g in groups:
-                if stop and stop.is_set():
-                    break
-                first = g["members"][0]
-                art, title, length = first["final_artist"], first["final_title"], first["length"]
-                try:
-                    if source == "dz":
-                        if g["album"]:
-                            info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_album(http, art, g["album"]))
-                        else:
-                            info = _cached(cache, "dz|" + g["key"], lambda: dz_lookup_track(http, title, art, length))
-                        if info and any("genre" in m["missing"] for m in g["members"]) and library_genres:
-                            g["dz_genres"] = _cached(cache, f"dzg|{info.get('album_id')}",
-                                                     lambda: dz_genre_names(http, info.get("album_id"),
-                                                                            info.get("genre_id"))) or []
-                    else:
-                        if g["album"]:
-                            info = _cached(cache, "mb|" + g["key"], lambda: mb_lookup_album(http, art, g["album"]))
-                        else:
-                            info = _cached(cache, "mb|" + g["key"],
-                                           lambda: mb_lookup_track(http, title, art, length))
-                except Exception as e:
-                    first["error"] = str(e)
-                    info = None
-                g[source] = info
-                if info and needs_cover(g):
-                    pending.append((g, source + "_cover", pool.submit(download_cover, http, info)))
-                apply_group(g, library_genres)
-                tick()
-                settle()
-        settle(block=True)
-    return len(groups)
+    # 2단계: 필요한 그룹만 MusicBrainz
+    mb_groups = [g for g in groups if needs_mb(g)] if not (stop and stop.is_set()) else []
+    state["phase"], state["total"] = "MusicBrainz", state["done"] + len(mb_groups)
+    if progress:
+        progress(state["done"], state["total"], state["phase"])
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = []
+        for g in mb_groups:
+            if stop and stop.is_set():
+                break
+            first = g["members"][0]
+            art, title, length = first["final_artist"], first["final_title"], first["length"]
+            try:
+                if g["album"]:
+                    info = _cached(cache, "mb|" + g["key"], lambda: mb_lookup_album(http, art, g["album"]))
+                else:
+                    info = _cached(cache, "mb|" + g["key"], lambda: mb_lookup_track(http, title, art, length))
+            except Exception as e:
+                first["error"] = str(e)
+                info = None
+            g["mb"] = info
+            if info and needs_cover(g):
+                pending.append((g, pool.submit(download_cover, http, info)))
+            apply_group(g, library_genres)
+            for item in list(pending):
+                if item[1].done():
+                    item[0]["mb_cover"] = item[1].result()
+                    pending.remove(item)
+                    apply_group(item[0], library_genres)
+            tick()
+            if on_update:
+                on_update()
+        for g, fut in pending:
+            try:
+                g["mb_cover"] = fut.result()
+            except Exception:
+                g["mb_cover"] = None
+            apply_group(g, library_genres)
+    return {"groups": len(groups), "mb_checked": len(mb_groups)}
 
 
 def count_online_groups(sugs):

@@ -778,15 +778,16 @@ class TagFixWindow(ctk.CTkToplevel):
                 self.sugs, pr["error"] = [], str(e)
             pr["stage"] = "local_done"
             if online and not self.stop_flag.is_set():
-                pr["stage"], pr["done"], pr["total"] = "online", 0, tf.count_online_groups(self.sugs) * 2
+                pr["stage"], pr["done"], pr["total"], pr["source"] = "online", 0, tf.count_online_groups(self.sugs), "Deezer"
                 cache = load_online_cache()
 
                 def oprog(done, total, source):
                     pr["done"], pr["total"], pr["source"] = done, total, source
 
                 try:
-                    tf.online_fill(self.sugs, tf.Http(), cache, self.lib_info.get("genres", {}),
-                                   progress=oprog, stop=self.stop_flag)
+                    res = tf.online_fill(self.sugs, tf.Http(), cache, self.lib_info.get("genres", {}),
+                                         progress=oprog, stop=self.stop_flag)
+                    pr["summary"] = res
                 except Exception as e:
                     pr["error"] = str(e)
                 save_online_cache(cache)
@@ -807,17 +808,18 @@ class TagFixWindow(ctk.CTkToplevel):
         if stage in ("", "local"):
             self.status.configure(text=f"태그 읽는 중… {pr['done']} / {pr['total']}")
         elif stage == "online":
-            half = pr["total"] // 2
-            if pr["source"] == "MusicBrainz" or pr["done"] > half:
+            if pr["source"] == "MusicBrainz":
                 left = (pr["total"] - pr["done"]) * 1.15
                 eta = f"{int(left // 60)}분 {int(left % 60)}초" if left >= 60 else f"{int(left)}초"
-                self.status.configure(text=f"MusicBrainz로 교차 확인 중… {pr['done'] - half} / {half} · 최대 약 {eta} 남음. "
-                                           "'중지'를 누르면 지금까지 결과로 적용할 수 있습니다(Deezer 결과는 이미 반영됨).")
+                self.status.configure(text=f"Deezer 완료. 확실하지 않은 {pr['total'] - pr['done']}개만 MusicBrainz로 확인 중… "
+                                           f"약 {eta} 남음. '중지'를 누르면 지금 결과로 바로 적용할 수 있습니다.")
             else:
-                self.status.configure(text=f"Deezer에서 찾는 중… {pr['done']} / {half}")
+                self.status.configure(text=f"Deezer에서 찾는 중… {pr['done']} / {pr['total']}")
             if time.monotonic() - self._last_refresh > 2:
                 self._last_refresh = time.monotonic()
                 self.refresh_rows()
+            else:
+                self.update_counts()
         if stage != "finished":
             self.after(400, self._poll)
             return
@@ -865,7 +867,8 @@ class TagFixWindow(ctk.CTkToplevel):
             else:
                 self.kind_boxes[k].deselect()
         n = sum(1 for i in rows if any(self.included(i, k) for k in self.row_kinds(i)))
-        ok = n > 0 and self.phase == "done"
+        mb_running = self.phase == "running" and self.progress.get("source") == "MusicBrainz"
+        ok = n > 0 and (self.phase == "done" or mb_running)  # Deezer가 끝나면 바로 적용 가능
         self.apply_btn.configure(text=f"적용 ({n}곡)", state="normal" if ok else "disabled")
 
     def toggle_kind(self, kind):
@@ -954,6 +957,20 @@ class TagFixWindow(ctk.CTkToplevel):
 
     # ───── 적용 ─────
     def apply(self):
+        if self.phase == "running":  # MusicBrainz 확인 중이면 멈추고, 멈춘 뒤 적용
+            self.stop_flag.set()
+            self.apply_btn.configure(state="disabled", text="확인 중지 중…")
+            self.after(300, self._apply_when_stopped)
+            return
+        self._apply_now()
+
+    def _apply_when_stopped(self):
+        if self.phase == "running":
+            self.after(300, self._apply_when_stopped)
+            return
+        self._apply_now()
+
+    def _apply_now(self):
         items = []
         for i in range(len(self.sugs)):
             if not self.row_kinds(i):
