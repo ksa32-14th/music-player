@@ -484,33 +484,29 @@ def rounded(img, size, radius):
 
 
 def make_note(size, color):
-    """겹음표(♫). 끝을 모두 둥글게 처리하고 8배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
+    """겹음표(♫). 기둥 바깥선과 들보 끝이 한 면으로 이어지게 그리고, 모든 모서리를 같은 반경으로 둥글린다.
+    8배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
+    from PIL import ImageFilter
     S = size * 8
     m = Image.new("L", (S, S), 0)
     d = ImageDraw.Draw(m)
-    w = S * 0.085                                  # 기둥 두께
-    beam = S * 0.13                                # 들보 두께
-    heads = [(S * 0.30, S * 0.76), (S * 0.70, S * 0.68)]   # 음표 머리 중심(오른쪽이 조금 높음)
-    rx, ry = S * 0.135, S * 0.105
-    tops = []
-    for hx, hy in heads:
+    w = S * 0.09                                    # 기둥 두께
+    beam = S * 0.15                                 # 들보 두께
+    heads = [(S * 0.29, S * 0.75), (S * 0.69, S * 0.67)]
+    rx, ry = S * 0.14, S * 0.11
+    for hx, hy in heads:                            # 머리: 살짝 기운 타원
         head = Image.new("L", (S, S), 0)
         ImageDraw.Draw(head).ellipse((hx - rx, hy - ry, hx + rx, hy + ry), fill=255)
-        head = head.rotate(22, center=(hx, hy), resample=Image.BICUBIC)
-        m.paste(255, (0, 0), head)
-        sx = hx + rx * 0.80                        # 기둥은 머리 오른쪽에서 위로
-        tops.append((sx, hy))
-    top_l, top_r = S * 0.20, S * 0.12              # 들보 높이(오른쪽이 높게 기울어짐)
-    for (sx, hy), ty in zip(tops, (top_l, top_r)):
-        d.rounded_rectangle((sx - w, ty + beam * 0.3, sx, hy - ry * 0.3), radius=w / 2, fill=255)
-    # 들보: 두 기둥 꼭대기를 잇는 두꺼운 선, 양 끝은 둥글게
-    (x1, _), (x2, _) = tops
-    p1, p2 = (x1 - w / 2, top_l + beam / 2), (x2 - w / 2, top_r + beam / 2)
-    n = 120
-    for k in range(n + 1):
-        t = k / n
-        cx, cy = p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t
-        d.ellipse((cx - beam / 2, cy - beam / 2, cx + beam / 2, cy + beam / 2), fill=255)
+        m.paste(255, (0, 0), head.rotate(22, center=(hx, hy), resample=Image.BICUBIC))
+    xl = heads[0][0] + rx * 0.82                    # 왼쪽 기둥의 오른쪽 선
+    xr = heads[1][0] + rx * 0.82                    # 오른쪽 기둥의 오른쪽 선
+    yl, yr = S * 0.22, S * 0.14                     # 들보 윗선 높이(오른쪽이 높음)
+    d.rectangle((xl - w, yl, xl, heads[0][1]), fill=255)
+    d.rectangle((xr - w, yr, xr, heads[1][1]), fill=255)
+    # 들보: 왼쪽 기둥 바깥선에서 오른쪽 기둥 바깥선까지, 끝은 세로로 반듯하게
+    d.polygon([(xl - w, yl), (xr, yr), (xr, yr + beam), (xl - w, yl + beam)], fill=255)
+    # 모서리 다듬기: 흐리게 한 뒤 절반 밝기에서 자르면 볼록한 모서리와 오목한 이음매가 함께 둥글어진다
+    m = m.filter(ImageFilter.GaussianBlur(S * 0.022)).point(lambda v: 255 if v >= 128 else 0)
     mask = m.resize((size, size), Image.LANCZOS)
     out = Image.new("RGBA", (size, size), color)
     out.putalpha(mask)
