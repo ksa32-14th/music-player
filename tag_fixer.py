@@ -929,7 +929,10 @@ def apply(sug, use_name=True, use_cover=True, use_fields=FIELDS):
             continue
         old_frame = tags.get(FRAME_IDS[f])
         backup["fields"][f] = str(old_frame.text[0]) if old_frame and old_frame.text else None
-        tags.setall(FRAME_IDS[f], [TEXT_FRAMES[f](encoding=1, text=[new])])
+        if new == "":  # 빈 값으로 저장하면 그 태그를 지운다
+            tags.delall(FRAME_IDS[f])
+        else:
+            tags.setall(FRAME_IDS[f], [TEXT_FRAMES[f](encoding=1, text=[new])])
         changed = True
     if use_cover and sug["cover"] and not tags.getall("APIC"):
         data, mime = compact_cover(*sug["cover"])

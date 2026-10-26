@@ -63,6 +63,8 @@ ACCENT_HOVER = "#E06F00"
 ACCENT_DEEP = "#C25F00"
 ON_ACCENT = "#1A1A1A"        # 주황 위에 올리는 글자·아이콘 색
 UNKNOWN_ARTIST = "알 수 없는 아티스트"
+SORT_COLS = ("title", "artist", "genre", "album", "time")
+COL_LABEL = {"title": "제목", "artist": "아티스트", "genre": "장르", "album": "앨범", "time": "시간"}
 UNKNOWN_ALBUM = "알 수 없는 앨범"
 
 
@@ -313,7 +315,7 @@ def _first(tags, key):
 
 def read_track(path):
     p = Path(path)
-    title = artist = album = ""
+    title = artist = album = genre = ""
     length = 0.0
     try:
         audio = MutagenFile(path, easy=True)
@@ -323,6 +325,7 @@ def read_track(path):
                 title = _first(audio.tags, "title")
                 artist = _first(audio.tags, "artist")
                 album = _first(audio.tags, "album")
+                genre = _first(audio.tags, "genre")
     except Exception:
         pass
     return {
@@ -331,7 +334,10 @@ def read_track(path):
         "title": title or p.stem,
         "artist": artist or UNKNOWN_ARTIST,
         "album": album or UNKNOWN_ALBUM,
+        "genre": genre,
         "length": length,
+        # 화면용 대체 문구가 아닌 실제 태그 값(정보 편집 창에서 사용)
+        "tag": {"title": title, "artist": artist, "album": album, "genre": genre},
     }
 
 
@@ -363,6 +369,7 @@ def shorten(text, n):
 
 # ───────────────────────── 라이브러리 스캔 캐시 ─────────────────────────
 SCAN_CACHE = DATA_DIR / "library_cache.json"
+SCAN_CACHE_VERSION = 2  # 2: 장르·실제 태그 값 추가
 _scan_lock = threading.Lock()
 
 
@@ -372,7 +379,7 @@ def load_scan_cache():
             data = json.load(f)
     except (OSError, ValueError):
         return {}
-    files = data.get("files") if isinstance(data, dict) and data.get("v") == 1 else None
+    files = data.get("files") if isinstance(data, dict) and data.get("v") == SCAN_CACHE_VERSION else None
     return files if isinstance(files, dict) else {}
 
 
@@ -382,7 +389,7 @@ def save_scan_cache(files):
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = SCAN_CACHE.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"v": 1, "files": files}, f, ensure_ascii=False)
+                json.dump({"v": SCAN_CACHE_VERSION, "files": files}, f, ensure_ascii=False)
             os.replace(tmp, SCAN_CACHE)
         except OSError:
             pass
@@ -1225,8 +1232,8 @@ class TagFixWindow(ctk.CTkToplevel):
         self.phase = "applying"
         self.apply_btn.configure(state="disabled")
         self.undo_btn.configure(state="disabled")
-        self.app.release_files([s["path"] for s in items])
-        result = {"done": 0, "backups": [], "errors": [], "t0": time.monotonic()}
+        resume = self.app.release_files([s["path"] for s in items])
+        result = {"done": 0, "backups": [], "errors": [], "t0": time.monotonic(), "resume": resume}
 
         def one(sug):
             try:
@@ -1260,7 +1267,8 @@ class TagFixWindow(ctk.CTkToplevel):
     def _apply_done(self, result):
         if result["backups"]:
             save_backup(result["backups"])
-        self.app.apply_file_changes([(b["old_path"], b["new_path"]) for b in result["backups"]])
+        self.app.apply_file_changes([(b["old_path"], b["new_path"]) for b in result["backups"]],
+                                    resume=result.get("resume"))
         msg = f"{len(result['backups'])}곡을 수정했습니다."
         if result["errors"]:
             msg += f"\n\n수정하지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
@@ -1279,8 +1287,8 @@ class TagFixWindow(ctk.CTkToplevel):
         self.phase = "applying"
         for b in (self.start_btn, self.apply_btn, self.undo_btn):
             b.configure(state="disabled")
-        self.app.release_files([e["new_path"] for e in entries])
-        result = {"done": 0, "mapping": {}, "errors": []}
+        resume = self.app.release_files([e["new_path"] for e in entries])
+        result = {"done": 0, "mapping": {}, "errors": [], "resume": resume}
 
         def worker():
             for e in entries:
@@ -1299,7 +1307,7 @@ class TagFixWindow(ctk.CTkToplevel):
             BACKUP_FILE.unlink()
         except OSError:
             pass
-        self.app.apply_file_changes(list(result["mapping"].items()))
+        self.app.apply_file_changes(list(result["mapping"].items()), resume=result.get("resume"))
         msg = f"{len(result['mapping'])}곡을 되돌렸습니다."
         if result["errors"]:
             msg += f"\n\n되돌리지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
@@ -1348,6 +1356,187 @@ def load_backup():
             return json.load(f)
     except (OSError, ValueError):
         return []
+
+
+# ───────────────────────── 정보 편집 창 ─────────────────────────
+class EditWindow(ctk.CTkToplevel):
+    """선택한 곡들의 제목·아티스트·장르·앨범을 표 형태로 고친다. 저장하면 파일 태그에 기록한다."""
+
+    FIELDS = ("title", "artist", "genre", "album")
+    MAX_ROWS = 300
+
+    def __init__(self, app, tracks):
+        super().__init__(app)
+        self.app = app
+        self.tracks = tracks[: self.MAX_ROWS]
+        self.title("정보 편집")
+        self.geometry(f"1180x{min(260 + 44 * len(self.tracks), 760)}")
+        self.minsize(900, 360)
+        self.transient(app)
+        self.font = app.font
+        self.entries = []      # 행마다 {필드: CTkEntry}
+        self.saving = False
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
+        ctk.CTkLabel(head, text="정보 편집", font=self.font(22, "bold")).pack(side="left")
+        more = f" (처음 {self.MAX_ROWS}곡만 표시)" if len(tracks) > self.MAX_ROWS else ""
+        self.status = ctk.CTkLabel(head, text=f"{len(self.tracks)}곡{more}", font=self.font(12),
+                                   text_color=("#555555", "#a8a8a8"))
+        self.status.pack(side="left", padx=(12, 4))
+        info_icon(head, "칸을 고친 뒤 '저장'을 누르면 파일에 기록됩니다(Ctrl+S).\n"
+                        "바뀐 칸은 주황 테두리로 표시됩니다. 칸을 비우고 저장하면 그 태그를 지웁니다.\n"
+                        "맨 위 '모두' 줄에 입력하고 ↓를 누르면 아래 모든 곡에 같은 값이 들어갑니다.").pack(side="left")
+
+        # 일괄 입력 줄
+        bulk = ctk.CTkFrame(self, corner_radius=10)
+        bulk.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 6))
+        self._grid_cols(bulk)
+        ctk.CTkLabel(bulk, text="모두", font=self.font(12, "bold"), anchor="w").grid(row=0, column=0, padx=(12, 6),
+                                                                                    pady=8, sticky="w")
+        genres = sorted({t.get("genre") for t in app.tracks if t.get("genre")}, key=str.casefold)
+        self.bulk = {}
+        for j, f in enumerate(self.FIELDS, start=1):
+            cell = ctk.CTkFrame(bulk, fg_color="transparent")
+            cell.grid(row=0, column=j, padx=4, pady=8, sticky="ew")
+            cell.grid_columnconfigure(0, weight=1)
+            if f == "genre":
+                w = ctk.CTkComboBox(cell, values=genres or [""], height=30, font=self.font(12))
+                w.set("")
+            else:
+                w = ctk.CTkEntry(cell, height=30, font=self.font(12),
+                                 placeholder_text=f"{COL_LABEL[f]} 일괄 입력")
+            w.grid(row=0, column=0, sticky="ew")
+            ctk.CTkButton(cell, text="↓", width=30, height=30, corner_radius=8, font=self.font(13, "bold"),
+                          command=lambda f=f: self.fill_all(f)).grid(row=0, column=1, padx=(4, 0))
+            self.bulk[f] = w
+
+        # 곡 목록
+        body = ctk.CTkScrollableFrame(self, corner_radius=10)
+        body.grid(row=2, column=0, sticky="nsew", padx=20, pady=4)
+        self._grid_cols(body)
+        for j, label in enumerate(["파일"] + [COL_LABEL[f] for f in self.FIELDS]):
+            ctk.CTkLabel(body, text=label, font=self.font(11, "bold"), text_color=("#6b6b6b", "#8f8f8f"),
+                         anchor="w").grid(row=0, column=j, padx=6, pady=(4, 2), sticky="w")
+        self._border = None
+        for i, t in enumerate(self.tracks, start=1):
+            ctk.CTkLabel(body, text=shorten(Path(t["path"]).name, 34), font=self.font(11), anchor="w",
+                         text_color=("#555555", "#a8a8a8")).grid(row=i, column=0, padx=6, pady=3, sticky="w")
+            row = {}
+            for j, f in enumerate(self.FIELDS, start=1):
+                e = ctk.CTkEntry(body, height=30, font=self.font(12))
+                e.insert(0, self.original(t, f))
+                e.grid(row=i, column=j, padx=4, pady=3, sticky="ew")
+                if self._border is None:
+                    self._border = e.cget("border_color")
+                e.bind("<KeyRelease>", lambda ev, i=i - 1, f=f: self.mark(i, f))
+                row[f] = e
+            self.entries.append(row)
+
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.grid(row=3, column=0, sticky="ew", padx=20, pady=(6, 16))
+        fmt = tf.NAME_FORMATS.get(app.data.get("name_format", "title_artist"), "제목_아티스트")
+        self.opt_rename = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(foot, text=f"파일명도 '{fmt}' 형식으로 맞추기", variable=self.opt_rename,
+                        font=self.font(12)).pack(side="left")
+        self.save_btn = ctk.CTkButton(foot, text="저장", width=120, height=36, corner_radius=18,
+                                      font=self.font(13, "bold"), command=self.save)
+        self.save_btn.pack(side="right")
+        ctk.CTkButton(foot, text="취소", width=90, height=36, corner_radius=18, font=self.font(12),
+                      fg_color="transparent", border_width=1, border_color=("#b5b5b5", "#3a3a3a"),
+                      hover_color=("#e2e2e2", "#232323"), text_color=("#1a1a1a", "#e8e8e8"),
+                      command=self.on_close).pack(side="right", padx=8)
+
+        self.bind("<Control-s>", lambda e: self.save())
+        self.bind("<Escape>", lambda e: self.on_close())
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(200, self.focus)
+
+    def _grid_cols(self, frame):
+        for j, wgt in enumerate((0, 3, 2, 1, 2)):
+            frame.grid_columnconfigure(j, weight=wgt, minsize=220 if j == 0 else 0)
+
+    @staticmethod
+    def original(t, f):
+        tag = t.get("tag")
+        if tag is not None:
+            return tag.get(f, "") or ""
+        # 예전 캐시 형식: 화면용 대체 문구는 빈 값으로
+        v = t.get(f, "") or ""
+        return "" if v in (UNKNOWN_ARTIST, UNKNOWN_ALBUM) else v
+
+    def mark(self, i, f):
+        e = self.entries[i][f]
+        changed = e.get().strip() != self.original(self.tracks[i], f)
+        e.configure(border_color=ACCENT if changed else self._border, border_width=2 if changed else 1)
+        n = sum(1 for k in range(len(self.tracks)) if self.row_changes(k))
+        self.status.configure(text=f"{len(self.tracks)}곡 · 바뀐 곡 {n}")
+
+    def fill_all(self, f):
+        v = self.bulk[f].get().strip()
+        for i, row in enumerate(self.entries):
+            row[f].delete(0, "end")
+            row[f].insert(0, v)
+            self.mark(i, f)
+
+    def row_changes(self, i):
+        t = self.tracks[i]
+        out = {}
+        for f in self.FIELDS:
+            new = self.entries[i][f].get().strip()
+            old = self.original(t, f)
+            if new != old:
+                out[f] = (old, new)
+        return out
+
+    def save(self):
+        if self.saving:
+            return
+        fmt = self.app.data.get("name_format", "title_artist")
+        items = []
+        for i, t in enumerate(self.tracks):
+            ch = self.row_changes(i)
+            new_name = None
+            if self.opt_rename.get():
+                title = self.entries[i]["title"].get().strip() or Path(t["path"]).stem
+                artist = self.entries[i]["artist"].get().strip()
+                if artist:
+                    nm = tf.build_filename(title, artist, fmt, Path(t["path"]).suffix.lower())
+                    new_name = nm if nm != Path(t["path"]).name else None
+            if ch or new_name:
+                items.append({"path": t["path"], "changes": ch, "cover": None, "new_name": new_name})
+        if not items:
+            self.on_close()
+            return
+        self.saving = True
+        self.save_btn.configure(state="disabled", text="저장 중…")
+        resume = self.app.release_files([s["path"] for s in items])
+        result = {"backups": [], "errors": []}
+
+        def worker():
+            for sug in items:
+                try:
+                    result["backups"].append(tf.apply(sug, use_name=bool(sug["new_name"]), use_cover=False,
+                                                      use_fields=tuple(sug["changes"])))
+                except Exception as e:
+                    result["errors"].append(f"{Path(sug['path']).name}: {e}")
+            self.after(0, lambda: self.done(result, resume))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def done(self, result, resume):
+        self.app.apply_file_changes([(b["old_path"], b["new_path"]) for b in result["backups"]], resume=resume)
+        if result["errors"]:
+            messagebox.showwarning("정보 편집", f"저장하지 못한 파일 {len(result['errors'])}개:\n"
+                                   + "\n".join(result["errors"][:10]), parent=self)
+        self.destroy()
+
+    def on_close(self):
+        if not self.saving:
+            self.destroy()
 
 
 # ───────────────────────── 메인 앱 ─────────────────────────
@@ -1562,12 +1751,14 @@ class MusicApp(ctk.CTk):
         holder.grid_rowconfigure(0, weight=1)
         holder.grid_columnconfigure(0, weight=1)
 
-        cols = ("title", "artist", "album", "time")
+        cols = SORT_COLS
         self.tree = ttk.Treeview(holder, columns=cols, show=("tree", "headings"), style="Music.Treeview",
                                  selectmode="extended")
         self.tree.heading("#0", text="")
-        for c, text in zip(cols, ("제목", "아티스트", "앨범", "시간")):
-            self.tree.heading(c, text=text, anchor="e" if c == "time" else "w")
+        for c in cols:
+            self.tree.heading(c, text=COL_LABEL[c], anchor="e" if c == "time" else "w",
+                              command=lambda c=c: self.on_sort(c))
+        self.update_sort_headings()
         self.tree.grid(row=0, column=0, sticky="nsew")
         sbar = ctk.CTkScrollbar(holder, command=self.tree.yview)
         sbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
@@ -1681,7 +1872,7 @@ class MusicApp(ctk.CTk):
             False: ImageTk.PhotoImage(make_heart(hs, "#6f6f6f" if dark else "#a0a0a0", filled=False), master=self),
         }
         self.tree.column("#0", width=int(44 * scale), minwidth=int(44 * scale), stretch=False, anchor="center")
-        widths = {"title": 300, "artist": 200, "album": 200, "time": 64}
+        widths = {"title": 280, "artist": 180, "genre": 110, "album": 200, "time": 64}
         for c, w in widths.items():
             self.tree.column(c, width=int(w * scale), minwidth=int(min(w, 60) * scale),
                              stretch=c != "time", anchor="e" if c == "time" else "w")
@@ -1791,18 +1982,57 @@ class MusicApp(ctk.CTk):
         items = self.base_tracks()
         if q:
             items = [t for t in items if q in t["title"].casefold() or q in t["artist"].casefold()
-                     or q in t["album"].casefold() or q in t["file"].casefold()]
+                     or q in t["album"].casefold() or q in t["file"].casefold()
+                     or q in t.get("genre", "").casefold()]
+        items = self.sorted_tracks(items)
         self.view_tracks = items
         self.tree.delete(*self.tree.get_children())
         cur = self.current["path"] if self.current else None
         for i, t in enumerate(items):
             self.tree.insert("", "end", iid=str(i), tags=("playing",) if t["path"] == cur else (),
                              image=self.tree_hearts[t["path"] in self.favorites],
-                             values=(t["title"], t["artist"], t["album"], fmt_time(t["length"])))
+                             values=(t["title"], t["artist"], t.get("genre", ""), t["album"], fmt_time(t["length"])))
         names = {"all": "모든 곡", "favorites": "즐겨찾기"}
         self.view_title.configure(text=names.get(self.view) if isinstance(self.view, str) else self.view[1])
         total = len(self.base_tracks())
         self.view_count.configure(text=f"검색 결과 {len(items)}곡 / 전체 {total}곡" if q else f"{total}곡")
+
+    # ───── 정렬 ─────
+    def on_sort(self, col):
+        """같은 열을 누를 때마다 오름차순 → 내림차순 → 원래 순서로 바뀐다."""
+        cur = self.data.get("sort") or {}
+        if cur.get("col") != col:
+            new = {"col": col, "desc": False}
+        elif not cur.get("desc"):
+            new = {"col": col, "desc": True}
+        else:
+            new = {}
+        self.data["sort"] = new
+        save_data(self.data)
+        self.update_sort_headings()
+        self.refresh_list()
+
+    def update_sort_headings(self):
+        cur = self.data.get("sort") or {}
+        for c in SORT_COLS:
+            arrow = (" ▼" if cur.get("desc") else " ▲") if cur.get("col") == c else ""
+            self.tree.heading(c, text=COL_LABEL[c] + arrow)
+
+    def sorted_tracks(self, items):
+        cur = self.data.get("sort") or {}
+        col = cur.get("col")
+        if col not in SORT_COLS:
+            return list(items)  # 원래 순서(라이브러리 기본 순서 또는 플레이리스트 순서)
+        if col == "time":
+            key = lambda t: t["length"]
+        else:
+            unknown = {"artist": UNKNOWN_ARTIST, "album": UNKNOWN_ALBUM}.get(col)
+
+            def key(t):
+                v = t.get(col) or ""
+                empty = not v or v == unknown  # 비어 있는 값은 순서와 관계없이 맨 뒤
+                return (empty if not cur.get("desc") else not empty, v.casefold(), t["title"].casefold())
+        return sorted(items, key=key, reverse=bool(cur.get("desc")))
 
     def mark_playing(self):
         cur = self.current["path"] if self.current else None
@@ -1841,6 +2071,9 @@ class MusicApp(ctk.CTk):
 
         menu = tk.Menu(self, tearoff=0, font=(UI_FONT, 10))
         menu.add_command(label="재생", command=lambda: self.play_from_view(int(row)))
+        menu.add_command(label="정보 편집…" + (f" ({len(paths)}곡)" if len(paths) > 1 else ""),
+                         command=lambda: self.open_editor(paths))
+        menu.add_separator()
         menu.add_command(label="즐겨찾기 해제" if all_fav else "즐겨찾기에 추가",
                          command=lambda: self.toggle_fav(paths, force=not all_fav))
         sub = tk.Menu(menu, tearoff=0, font=(UI_FONT, 10))
@@ -2106,15 +2339,21 @@ class MusicApp(ctk.CTk):
             scope = "검색 결과" if self.search.get().strip() else self.view_title.cget("text")
         self.tag_window = TagFixWindow(self, [t["path"] for t in targets], scope)
 
+    def open_editor(self, paths):
+        tracks = [self.by_path[p] for p in paths if p in self.by_path]
+        if tracks:
+            EditWindow(self, tracks)
+
     def release_files(self, paths):
-        """수정할 파일 중 재생 중인 곡이 있으면 재생을 멈춘다."""
+        """수정할 파일 중 재생 중인 곡이 있으면 잠시 멈춘다. 저장 후 이어서 재생할 정보를 돌려준다."""
         if self.current and self.current["path"] in set(paths) and self.player.loaded:
+            resume = {"path": self.current["path"], "pos": self.player.position(), "paused": self.player.paused}
             self.player.release()
             self.update_play_icon()
-            self.seek.set(0)
-            self.time_now.configure(text="0:00")
+            return resume
+        return None
 
-    def apply_file_changes(self, changes):
+    def apply_file_changes(self, changes, resume=None):
         """태그 정리로 바뀐 파일만 다시 읽어 목록을 갱신한다(라이브러리 전체를 다시 스캔하지 않음).
         changes: [(이전 경로, 새 경로)]"""
         t0 = time.monotonic()
@@ -2142,6 +2381,18 @@ class MusicApp(ctk.CTk):
                 self.update_now_playing()
         update_scan_cache(fresh.values(), removed=gone - set(fresh))
         self.refresh_list()
+        if resume:  # 잠시 멈췄던 곡을 새 경로에서 같은 위치부터 이어서 재생
+            t = self.by_path.get(mapping.get(resume["path"], resume["path"]))
+            if t:
+                try:
+                    self.player.play(t["path"], t["length"], start=resume["pos"])
+                    if resume["paused"]:
+                        self.player.pause()
+                    self.current = t
+                    self.update_now_playing()
+                    self.mark_playing()
+                except Exception:
+                    pass
         ulog(f"list refresh after apply: {len(fresh)} files in {time.monotonic() - t0:.2f}s")
 
     def remap_paths(self, mapping):
