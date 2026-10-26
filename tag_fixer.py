@@ -932,19 +932,44 @@ def apply(sug, use_name=True, use_cover=True, use_fields=FIELDS):
         tags.setall(FRAME_IDS[f], [TEXT_FRAMES[f](encoding=1, text=[new])])
         changed = True
     if use_cover and sug["cover"] and not tags.getall("APIC"):
-        data, mime = sug["cover"]
+        data, mime = compact_cover(*sug["cover"])
         tags.add(APIC(encoding=1, mime=mime, type=3, desc="Cover", data=data))
         backup["cover_added"] = True
         changed = True
     if changed:
-        tags.save(path, v2_version=3)  # Windows 탐색기 호환을 위해 ID3v2.3으로 저장
+        # Windows 탐색기 호환을 위해 ID3v2.3으로 저장. 여유 공간(padding)을 넉넉히 두어
+        # 다음에 태그를 고칠 때는 파일 전체를 다시 쓰지 않아도 되게 한다.
+        tags.save(path, v2_version=3, padding=_padding)
 
     if use_name and sug["new_name"]:
-        target = _unique_path(path.with_name(sug["new_name"]), path)
-        if target != path:
-            os.rename(path, target)
-            backup["new_path"] = str(target)
+        with _RENAME_LOCK:  # 여러 파일을 동시에 처리할 때 같은 새 이름을 두 번 고르지 않게
+            target = _unique_path(path.with_name(sug["new_name"]), path)
+            if target != path:
+                os.rename(path, target)
+                backup["new_path"] = str(target)
     return backup
+
+
+_RENAME_LOCK = __import__("threading").Lock()
+
+
+def _padding(info):
+    """기존 여유 공간에 들어가면 그대로 둬서 파일을 다시 쓰지 않고, 넘치면 16KB 여유를 두고 한 번만 다시 쓴다."""
+    return info.padding if info.padding >= 0 else 16384
+
+
+def compact_cover(data, mime, max_px=600, max_bytes=200_000):
+    """커버가 지나치게 크면 600px·JPEG로 줄인다(파일마다 쓰는 양을 줄여 적용을 빠르게)."""
+    if len(data) <= max_bytes:
+        return data, mime
+    img, _ = _load_image(data)
+    if img is None:
+        return data, mime
+    img = img.convert("RGB")
+    img.thumbnail((max_px, max_px))
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=88, optimize=True)
+    return buf.getvalue(), "image/jpeg"
 
 
 def undo(entry):

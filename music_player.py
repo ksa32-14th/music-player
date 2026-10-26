@@ -36,8 +36,10 @@ APP_NAME = "Music Player"
 DATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "ModernMusicPlayer"
 DATA_FILE = DATA_DIR / "data.json"
 UI_FONT = "Malgun Gothic" if sys.platform.startswith("win") else "Helvetica"
-ACCENT = "#1fb85a"
-ACCENT_RGB = (31, 184, 90)
+ACCENT = "#FF8000"          # 기본 강조색
+ACCENT_RGB = (255, 128, 0)
+ACCENT_HOVER = "#E06F00"
+ACCENT_DEEP = "#C25F00"
 UNKNOWN_ARTIST = "알 수 없는 아티스트"
 UNKNOWN_ALBUM = "알 수 없는 앨범"
 
@@ -337,6 +339,108 @@ def shorten(text, n):
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# ───────────────────────── 라이브러리 스캔 캐시 ─────────────────────────
+SCAN_CACHE = DATA_DIR / "library_cache.json"
+_scan_lock = threading.Lock()
+
+
+def load_scan_cache():
+    try:
+        with open(SCAN_CACHE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    files = data.get("files") if isinstance(data, dict) and data.get("v") == 1 else None
+    return files if isinstance(files, dict) else {}
+
+
+def save_scan_cache(files):
+    with _scan_lock:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = SCAN_CACHE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"v": 1, "files": files}, f, ensure_ascii=False)
+            os.replace(tmp, SCAN_CACHE)
+        except OSError:
+            pass
+
+
+def update_scan_cache(tracks, removed=()):
+    cache = load_scan_cache()
+    for p in removed:
+        cache.pop(p, None)
+    for t in tracks:
+        try:
+            st = os.stat(t["path"])
+            cache[t["path"]] = {"sig": [st.st_mtime_ns, st.st_size], "track": t}
+        except OSError:
+            cache.pop(t["path"], None)
+    save_scan_cache(cache)
+
+
+# ───────────────────────── 테마 ─────────────────────────
+def build_theme():
+    """CustomTkinter 기본 'green' 테마의 초록색을 주황(#FF8000) 계열로 바꾼 테마 파일을 만든다."""
+    src = Path(ctk.__file__).resolve().parent / "assets" / "themes" / "green.json"
+    swap = {"#2CC985": ACCENT, "#2FA572": ACCENT, "#2CBE79": ACCENT,
+            "#0C955A": ACCENT_HOVER, "#106A43": ACCENT_HOVER,
+            "#0B6E3D": ACCENT_DEEP, "#17472E": "#A35000"}
+    try:
+        theme = json.loads(src.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "green"
+
+    def walk(x):
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        if isinstance(x, str):
+            return swap.get(x.upper(), x)
+        return x
+
+    theme = walk(theme)
+    for widget in ("CTkButton", "CTkOptionMenu", "CTkSegmentedButton"):  # 주황 위 글자는 흰색
+        if widget in theme and "text_color" in theme[widget]:
+            theme[widget]["text_color"] = ["#FFFFFF", "#FFFFFF"]
+    out = DATA_DIR / "theme_orange.json"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(theme), encoding="utf-8")
+        return str(out)
+    except OSError:
+        return "green"
+
+
+# ───────────────────────── 재생목록 내보내기 ─────────────────────────
+def write_m3u(target, tracks):
+    """확장 M3U를 쓴다. .m3u8은 UTF-8, .m3u는 Windows 플레이어 호환을 위해 한국어 Windows 기본
+    인코딩(CP949)으로 쓰고, CP949로 쓸 수 없는 글자가 있으면 UTF-8(BOM 포함)로 쓴다.
+    돌려주는 값: 디스크에 없는 파일 수."""
+    lines = ["#EXTM3U"]
+    missing = 0
+    for t in tracks:
+        path = t["path"]
+        if not os.path.exists(path):
+            missing += 1
+        length = int(round(t.get("length") or 0)) or -1
+        title, artist = t.get("title") or Path(path).stem, t.get("artist")
+        label = f"{artist} - {title}" if artist and artist != UNKNOWN_ARTIST else title
+        lines += [f"#EXTINF:{length},{label}", os.path.abspath(path)]
+    text = "\r\n".join(lines) + "\r\n"
+    if str(target).lower().endswith(".m3u8"):
+        data = text.encode("utf-8")
+    else:
+        try:
+            data = text.encode("cp949")
+        except UnicodeEncodeError:
+            data = b"\xef\xbb\xbf" + text.encode("utf-8")
+    with open(target, "wb") as f:
+        f.write(data)
+    return missing
+
+
 # ───────────────────────── 이미지 헬퍼 ─────────────────────────
 def rounded(img, size, radius):
     img = img.convert("RGB")
@@ -351,6 +455,40 @@ def rounded(img, size, radius):
     return out
 
 
+def make_note(size, color):
+    """둥근 끝을 가진 음표(♪). 8배로 그린 뒤 줄여 가장자리를 매끄럽게 한다."""
+    S = size * 8
+    img = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(img)
+    stroke = S * 0.075                       # 기둥·깃발 두께
+    head_cx, head_cy = S * 0.40, S * 0.72    # 음표 머리 중심
+    rx, ry = S * 0.16, S * 0.125
+    # 머리: 살짝 기운 타원
+    head = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(head).ellipse((head_cx - rx, head_cy - ry, head_cx + rx, head_cy + ry), fill=255)
+    head = head.rotate(20, center=(head_cx, head_cy), resample=Image.BICUBIC)
+    img.paste(255, (0, 0), head)
+    # 기둥: 머리 오른쪽 끝에서 위로, 끝은 둥글게
+    sx = head_cx + rx * 0.86
+    top_y = S * 0.16
+    d.rounded_rectangle((sx - stroke, top_y, sx, head_cy - ry * 0.2), radius=stroke / 2, fill=255)
+    # 깃발: 기둥 꼭대기에서 오른쪽 아래로 휘는 곡선을 둥근 붓으로 그린다
+    p0, p1, p2, p3 = (sx - stroke / 2, top_y + stroke / 2), (sx + S * 0.10, top_y + S * 0.08), \
+                     (sx + S * 0.25, top_y + S * 0.12), (sx + S * 0.20, top_y + S * 0.34)
+    rr = stroke / 2
+    for k in range(200):
+        t = k / 199
+        mt = 1 - t
+        x = mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0] + 3 * mt * t * t * p2[0] + t ** 3 * p3[0]
+        y = mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1] + 3 * mt * t * t * p2[1] + t ** 3 * p3[1]
+        w = rr * (1.0 - 0.25 * t)            # 끝으로 갈수록 살짝 가늘게
+        d.ellipse((x - w, y - w, x + w, y + w), fill=255)
+    mask = img.resize((size, size), Image.LANCZOS)
+    out = Image.new("RGBA", (size, size), color)
+    out.putalpha(mask)
+    return out
+
+
 def placeholder(size):
     """앨범 아트가 없을 때 쓰는 그라데이션 + 음표 이미지."""
     img = Image.new("RGB", (size, size))
@@ -359,12 +497,9 @@ def placeholder(size):
     for y in range(size):
         t = y / size
         d.line([(0, y), (size, y)], fill=tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
-    r = size * 0.11
-    cx, cy = size * 0.44, size * 0.64
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=ACCENT_RGB)
-    stem_x = cx + r - size * 0.035
-    d.rectangle((stem_x, size * 0.26, cx + r, cy), fill=ACCENT_RGB)
-    d.polygon([(cx + r, size * 0.26), (cx + r + size * 0.16, size * 0.34), (cx + r, size * 0.40)], fill=ACCENT_RGB)
+    note = make_note(int(size * 0.56), ACCENT_RGB)
+    off = (size - note.size[0]) // 2
+    img.paste(note, (off, off), note)
     return img
 
 
@@ -488,6 +623,74 @@ def ctk_icon(kind, size, light_color, dark_color):
     )
 
 
+# ───────────────────────── 도움말 아이콘(ⓘ) ─────────────────────────
+def make_info_icon(size, color):
+    """동그라미 안의 작은 느낌표."""
+    S = size * 8
+    m = Image.new("L", (S, S), 0)
+    d = ImageDraw.Draw(m)
+    w = S * 0.09
+    d.ellipse((w / 2, w / 2, S - w / 2, S - w / 2), outline=255, width=int(w))
+    bar = S * 0.11
+    d.rounded_rectangle((S / 2 - bar / 2, S * 0.24, S / 2 + bar / 2, S * 0.60), radius=bar / 2, fill=255)
+    d.ellipse((S / 2 - bar * 0.65, S * 0.68, S / 2 + bar * 0.65, S * 0.68 + bar * 1.3), fill=255)
+    mask = m.resize((size, size), Image.LANCZOS)
+    out = Image.new("RGBA", (size, size), color)
+    out.putalpha(mask)
+    return out
+
+
+class Tooltip:
+    """위젯에 마우스를 올리면 설명 창을 띄운다."""
+
+    def __init__(self, widget, text, wrap=340):
+        self.widget, self.text, self.wrap = widget, text, wrap
+        self.tip = None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def show(self, _=None):
+        if self.tip or not self.text:
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        x, y = self.widget.winfo_pointerx() + 14, self.widget.winfo_pointery() + 16
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        try:
+            tw.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        border = "#3a3a3a" if dark else "#d0d0d0"
+        frame = tk.Frame(tw, bg=border, padx=1, pady=1)
+        frame.pack()
+        tk.Label(frame, text=self.text, justify="left", wraplength=self.wrap, padx=12, pady=9,
+                 bg="#262626" if dark else "#ffffff", fg="#ececec" if dark else "#1a1a1a",
+                 font=(UI_FONT, 10)).pack()
+        tw.update_idletasks()
+        sw = tw.winfo_screenwidth()  # 화면 오른쪽 밖으로 나가지 않게
+        x = min(x, sw - tw.winfo_width() - 8)
+        tw.wm_geometry(f"+{x}+{y}")
+
+    def hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+_INFO_ICON = {}
+
+
+def info_icon(parent, text, size=15):
+    """ⓘ 아이콘 라벨을 만들어 돌려준다(배치는 호출한 쪽에서)."""
+    if "img" not in _INFO_ICON:
+        _INFO_ICON["img"] = ctk.CTkImage(light_image=make_info_icon(size * 2, "#8a8a8a"),
+                                         dark_image=make_info_icon(size * 2, "#9a9a9a"), size=(size, size))
+    lbl = ctk.CTkLabel(parent, text="", image=_INFO_ICON["img"], width=size + 4, cursor="question_arrow")
+    Tooltip(lbl, text)
+    return lbl
+
+
 # ───────────────────────── 오디오 엔진 ─────────────────────────
 class Player:
     def __init__(self, volume):
@@ -603,12 +806,18 @@ class TagFixWindow(ctk.CTkToplevel):
         head.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="태그 정리", font=self.font(22, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
-        self.status = ctk.CTkLabel(
-            head, anchor="w", justify="left", font=self.font(12), text_color=("#555555", "#a8a8a8"),
-            text=f"대상: {scope} {len(paths)}곡\n"
-                 "내 라이브러리 안에서 같은 아티스트·앨범의 다른 표기, 깨진 글자, 빈 태그, 파일명 형식을 점검하고, "
-                 "빈 커버·앨범·장르는 Deezer와 MusicBrainz에서 찾아 서로 대조합니다. '적용'을 누르기 전에는 아무것도 바뀌지 않습니다.")
-        self.status.grid(row=1, column=0, sticky="w", pady=(2, 6))
+        line = ctk.CTkFrame(head, fg_color="transparent")
+        line.grid(row=1, column=0, sticky="w", pady=(2, 6))
+        self.status = ctk.CTkLabel(line, anchor="w", justify="left", font=self.font(12),
+                                   text_color=("#555555", "#a8a8a8"), text=f"대상: {scope} {len(paths)}곡")
+        self.status.pack(side="left")
+        info_icon(line, "무엇을 점검하나요?\n"
+                        "· 같은 아티스트·앨범이 다르게 적힌 곡 (예: IU / 아이유 / 아이유(IU))\n"
+                        "· 깨진 한글, 비어 있는 제목·아티스트\n"
+                        "· 고른 형식과 다른 파일명\n"
+                        "· 빈 커버·앨범·장르 (온라인 검색)\n\n"
+                        "'적용'을 누르기 전에는 파일이 바뀌지 않으며, 마지막 적용은 되돌릴 수 있습니다.").pack(
+            side="left", padx=(6, 0))
         self.bar = ctk.CTkProgressBar(head, height=8)
         self.bar.set(0)
         self.bar.grid(row=2, column=0, sticky="ew")
@@ -618,7 +827,8 @@ class TagFixWindow(ctk.CTkToplevel):
 
         opts = ctk.CTkFrame(self, fg_color="transparent")
         opts.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 2))
-        ctk.CTkLabel(opts, text="파일명 형식", font=self.font(12)).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(opts, text="파일명 형식", font=self.font(12)).pack(side="left", padx=(0, 4))
+        info_icon(opts, "파일 이름을 읽고 제안할 때 쓰는 형식입니다. 고른 형식은 저장됩니다.").pack(side="left", padx=(0, 6))
         fmt = app.data.get("name_format", "title_artist")
         self.fmt_labels = {v: k for k, v in tf.NAME_FORMATS.items()}
         self.fmt_menu = ctk.CTkOptionMenu(opts, values=list(tf.NAME_FORMATS.values()), width=130, height=28,
@@ -626,16 +836,22 @@ class TagFixWindow(ctk.CTkToplevel):
         self.fmt_menu.set(tf.NAME_FORMATS.get(fmt, "제목_아티스트"))
         self.fmt_menu.pack(side="left")
         self.opt_online = ctk.BooleanVar(value=True)
-        self.online_chk = ctk.CTkCheckBox(opts, text="빈 커버·앨범·장르를 온라인에서 찾기 (Deezer + MusicBrainz)",
-                                          variable=self.opt_online, font=self.font(12))
-        self.online_chk.pack(side="left", padx=(18, 0))
-        ctk.CTkLabel(opts, text="장르는 내 라이브러리에 이미 있는 장르 안에서만 제안합니다.", font=self.font(11),
-                     text_color=("#777777", "#8a8a8a")).pack(side="left", padx=(14, 0))
+        self.online_chk = ctk.CTkCheckBox(opts, text="온라인에서 빈 정보 찾기", variable=self.opt_online,
+                                          font=self.font(12))
+        self.online_chk.pack(side="left", padx=(18, 4))
+        info_icon(opts, "빈 커버·앨범·장르를 Deezer에서 먼저 찾고, 확실하지 않은 것만 MusicBrainz로 대조합니다.\n\n"
+                        "· 두 곳의 커버가 같은 그림이면 '높음'으로 자동 적용\n"
+                        "· 서로 다르거나 한 곳에서만 찾으면 [제외] 상태로 두고 직접 고르게 합니다\n"
+                        "· 장르는 내 라이브러리에 이미 있는 장르 안에서만 제안합니다\n"
+                        "· 한 번 찾은 결과는 저장되어 다음 검사가 빨라집니다").pack(side="left")
 
         # 종류별 요약: 체크하면 그 종류 전체 적용/제외
         summary = ctk.CTkFrame(self, corner_radius=10)
         summary.grid(row=2, column=0, sticky="ew", padx=20, pady=(6, 4))
-        ctk.CTkLabel(summary, text="종류별 적용", font=self.font(12, "bold")).pack(side="left", padx=(12, 10), pady=8)
+        ctk.CTkLabel(summary, text="종류별 적용", font=self.font(12, "bold")).pack(side="left", padx=(12, 4), pady=8)
+        info_icon(summary, "숫자는 '적용할 칸 / 제안된 칸'입니다. 체크를 끄면 그 종류 전체가 빠집니다.\n"
+                           "표에서 칸을 클릭하면 그 칸만, 맨 왼쪽 칸을 클릭하면 그 곡 전체를 넣거나 뺍니다.").pack(
+            side="left", padx=(0, 10))
         self.kind_vars, self.kind_boxes = {}, {}
         for k in self.KINDS:
             var = ctk.BooleanVar(value=True)
@@ -671,7 +887,7 @@ class TagFixWindow(ctk.CTkToplevel):
         detail.grid_columnconfigure(1, weight=1)
         self.cover_box = ctk.CTkFrame(detail, fg_color="transparent")
         self.cover_box.grid(row=0, column=0, padx=10, pady=10, sticky="n")
-        self.detail_lbl = ctk.CTkLabel(detail, text="칸을 클릭하면 그 항목만 적용/제외됩니다. 행을 선택하면 근거와 커버 후보가 보입니다.",
+        self.detail_lbl = ctk.CTkLabel(detail, text="곡을 선택하면 근거와 커버 후보가 보입니다.",
                                        font=self.font(12), anchor="nw", justify="left", wraplength=900)
         self.detail_lbl.grid(row=0, column=1, sticky="nsew", padx=(4, 12), pady=12)
 
@@ -811,8 +1027,7 @@ class TagFixWindow(ctk.CTkToplevel):
             if pr["source"] == "MusicBrainz":
                 left = (pr["total"] - pr["done"]) * 1.15
                 eta = f"{int(left // 60)}분 {int(left % 60)}초" if left >= 60 else f"{int(left)}초"
-                self.status.configure(text=f"Deezer 완료. 확실하지 않은 {pr['total'] - pr['done']}개만 MusicBrainz로 확인 중… "
-                                           f"약 {eta} 남음. '중지'를 누르면 지금 결과로 바로 적용할 수 있습니다.")
+                self.status.configure(text=f"MusicBrainz로 확인 중… 약 {eta} 남음 (지금 적용 가능)")
             else:
                 self.status.configure(text=f"Deezer에서 찾는 중… {pr['done']} / {pr['total']}")
             if time.monotonic() - self._last_refresh > 2:
@@ -828,8 +1043,7 @@ class TagFixWindow(ctk.CTkToplevel):
         n = sum(1 for i in range(len(self.sugs)) if self.row_kinds(i))
         stopped = " (중지됨)" if self.stop_flag.is_set() else ""
         err = f" · 오류: {pr['error']}" if pr.get("error") else ""
-        self.status.configure(text=f"검사 끝{stopped}: {len(self.sugs)}곡 중 {n}곡에 수정안이 있습니다{err}. "
-                                   "칸을 클릭하면 그 항목만 빼거나 넣을 수 있고, 확실하지 않은 커버는 [제외] 상태로 둡니다.")
+        self.status.configure(text=f"검사 끝{stopped}: {len(self.sugs)}곡 중 {n}곡에 수정안{err}")
         self.bar.set(1)
         self.start_btn.configure(text="검사 완료", state="disabled")
         self.undo_btn.configure(state="normal" if BACKUP_FILE.exists() else "disabled")
@@ -988,17 +1202,23 @@ class TagFixWindow(ctk.CTkToplevel):
         self.apply_btn.configure(state="disabled")
         self.undo_btn.configure(state="disabled")
         self.app.release_files([s["path"] for s in items])
-        result = {"done": 0, "backups": [], "errors": []}
+        result = {"done": 0, "backups": [], "errors": [], "t0": time.monotonic()}
+
+        def one(sug):
+            try:
+                result["backups"].append(tf.apply(sug, use_name=bool(sug["new_name"]),
+                                                  use_cover=bool(sug["cover"]),
+                                                  use_fields=tuple(sug["changes"])))
+            except Exception as e:
+                result["errors"].append(f"{Path(sug['path']).name}: {e}")
+            result["done"] += 1
 
         def worker():
-            for sug in items:
-                try:
-                    result["backups"].append(tf.apply(sug, use_name=bool(sug["new_name"]),
-                                                      use_cover=bool(sug["cover"]),
-                                                      use_fields=tuple(sug["changes"])))
-                except Exception as e:
-                    result["errors"].append(f"{Path(sug['path']).name}: {e}")
-                result["done"] += 1
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=3) as pool:  # 파일 쓰기와 백신 검사 대기를 겹쳐 처리
+                list(pool.map(one, items))
+            ulog(f"tag apply: {len(items)} files in {time.monotonic() - result['t0']:.1f}s "
+                 f"(errors {len(result['errors'])})")
 
         threading.Thread(target=worker, daemon=True).start()
         self._poll_job(result, len(items), self._apply_done)
@@ -1016,7 +1236,7 @@ class TagFixWindow(ctk.CTkToplevel):
     def _apply_done(self, result):
         if result["backups"]:
             save_backup(result["backups"])
-        self.app.remap_paths({b["old_path"]: b["new_path"] for b in result["backups"]})
+        self.app.apply_file_changes([(b["old_path"], b["new_path"]) for b in result["backups"]])
         msg = f"{len(result['backups'])}곡을 수정했습니다."
         if result["errors"]:
             msg += f"\n\n수정하지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
@@ -1048,13 +1268,14 @@ class TagFixWindow(ctk.CTkToplevel):
 
         threading.Thread(target=worker, daemon=True).start()
         self._poll_job(result, len(entries), self._undo_done)
+        result.setdefault("t0", time.monotonic())
 
     def _undo_done(self, result):
         try:
             BACKUP_FILE.unlink()
         except OSError:
             pass
-        self.app.remap_paths(result["mapping"])
+        self.app.apply_file_changes(list(result["mapping"].items()))
         msg = f"{len(result['mapping'])}곡을 되돌렸습니다."
         if result["errors"]:
             msg += f"\n\n되돌리지 못한 파일 {len(result['errors'])}개:\n" + "\n".join(result["errors"][:10])
@@ -1110,7 +1331,7 @@ class MusicApp(ctk.CTk):
     def __init__(self):
         self.data = load_data()
         ctk.set_appearance_mode(self.data.get("appearance", "dark"))
-        ctk.set_default_color_theme("green")
+        ctk.set_default_color_theme(build_theme())
         super().__init__()
         self.title(APP_NAME)
         self.geometry("1320x800")
@@ -1245,7 +1466,9 @@ class MusicApp(ctk.CTk):
         sb.grid_columnconfigure(0, weight=1)
         sb.grid_rowconfigure(4, weight=1)
 
-        ctk.CTkLabel(sb, text="♪  Music", font=self.font(22, "bold"), anchor="w").grid(
+        self.ic_logo = ctk.CTkImage(make_note(56, ACCENT), size=(26, 26))
+        ctk.CTkLabel(sb, text="  Music", image=self.ic_logo, compound="left", font=self.font(22, "bold"),
+                     anchor="w").grid(
             row=0, column=0, padx=22, pady=(26, 18), sticky="ew")
         self.nav_all = self._nav_button(sb, "모든 곡", lambda: self.set_view("all"))
         self.nav_all.grid(row=1, column=0, padx=12, pady=2, sticky="ew")
@@ -1255,8 +1478,13 @@ class MusicApp(ctk.CTk):
         head = ctk.CTkFrame(sb, fg_color="transparent")
         head.grid(row=3, column=0, padx=12, pady=(22, 4), sticky="ew")
         head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(head, text="플레이리스트", font=self.font(12, "bold"),
-                     text_color=("#6b6b6b", "#8a8a8a"), anchor="w").grid(row=0, column=0, padx=10, sticky="w")
+        ttl = ctk.CTkFrame(head, fg_color="transparent")
+        ttl.grid(row=0, column=0, padx=10, sticky="w")
+        ctk.CTkLabel(ttl, text="플레이리스트", font=self.font(12, "bold"),
+                     text_color=("#6b6b6b", "#8a8a8a"), anchor="w").pack(side="left")
+        info_icon(ttl, "+ 로 새로 만들고, 곡을 우클릭해 추가합니다.\n"
+                       "플레이리스트를 우클릭하면 M3U 파일로 내보내거나 삭제할 수 있습니다.", size=13).pack(
+            side="left", padx=(4, 0))
         ctk.CTkButton(head, text="+", width=28, height=28, corner_radius=14, font=self.font(16),
                       fg_color="transparent", hover_color=("#e2e2e2", "#232323"),
                       text_color=("#1a1a1a", "#e8e8e8"),
@@ -1274,7 +1502,11 @@ class MusicApp(ctk.CTk):
         ctk.CTkButton(sb, text="태그 정리", height=36, corner_radius=18, font=self.font(13, "bold"),
                       fg_color="transparent", border_width=1, border_color=("#b5b5b5", "#3a3a3a"),
                       hover_color=("#e2e2e2", "#232323"), text_color=("#1a1a1a", "#e8e8e8"),
-                      command=self.open_tag_fixer).grid(row=7, column=0, padx=18, pady=(0, 10), sticky="ew")
+                      command=self.open_tag_fixer)
+        self.tag_btn = sb.winfo_children()[-1]
+        self.tag_btn.grid(row=7, column=0, padx=18, pady=(0, 10), sticky="ew")
+        Tooltip(self.tag_btn, "제목·아티스트·앨범 표기, 빈 커버·장르, 파일명을 점검해 고칠 내용을 보여 줍니다.\n"
+                              "목록에서 곡을 2개 이상 골라 두면 그 곡들만 점검합니다.")
 
         self.theme_switch = ctk.CTkSwitch(sb, text="다크 모드", font=self.font(12), command=self.toggle_theme)
         self.theme_switch.grid(row=8, column=0, padx=22, pady=(0, 20), sticky="w")
@@ -1400,7 +1632,7 @@ class MusicApp(ctk.CTk):
         bg = "#181818" if dark else "#ffffff"
         fg = "#e8e8e8" if dark else "#1a1a1a"
         sub = "#8f8f8f" if dark else "#6b6b6b"
-        sel = "#26352c" if dark else "#dcf2e4"
+        sel = "#3a2a18" if dark else "#ffe6cc"
         scale = ctk.ScalingTracker.get_window_scaling(self)
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -1448,17 +1680,34 @@ class MusicApp(ctk.CTk):
         self._scan_state = state
 
         def worker():
+            t0 = time.monotonic()
             files = []
             for root, _, names in os.walk(folder):
                 files += [os.path.join(root, n) for n in names if n.lower().endswith(".mp3")]
             state["total"] = len(files)
-            result = []
+            cache = load_scan_cache()
+            result, reread = [], 0
             for i, f in enumerate(files, 1):
-                result.append(read_track(f))
+                try:
+                    st = os.stat(f)
+                    sig = [st.st_mtime_ns, st.st_size]
+                except OSError:
+                    continue
+                hit = cache.get(f)
+                if hit and hit.get("sig") == sig:  # 바뀌지 않은 파일은 태그를 다시 읽지 않는다
+                    result.append(hit["track"])
+                else:
+                    t = read_track(f)
+                    result.append(t)
+                    cache[f] = {"sig": sig, "track": t}
+                    reread += 1
                 state["count"] = i
+            alive = set(files)
+            save_scan_cache({k: v for k, v in cache.items() if k in alive})
             result.sort(key=lambda t: (t["artist"].casefold(), t["album"].casefold(), t["title"].casefold()))
             state["result"] = result
             state["done"] = True
+            ulog(f"scan: {len(files)} files, {reread} read, {time.monotonic() - t0:.2f}s")
 
         threading.Thread(target=worker, daemon=True).start()
         self.view_count.configure(text="폴더를 스캔하는 중…")
@@ -1619,6 +1868,8 @@ class MusicApp(ctk.CTk):
 
     def _playlist_menu(self, event, name):
         menu = tk.Menu(self, tearoff=0, font=(UI_FONT, 10))
+        menu.add_command(label="M3U 파일로 내보내기…", command=lambda: self.export_playlist(name))
+        menu.add_separator()
         menu.add_command(label="플레이리스트 삭제", command=lambda: self.delete_playlist(name))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1652,6 +1903,30 @@ class MusicApp(ctk.CTk):
         self.data["playlists"][name] = [p for p in self.data["playlists"].get(name, []) if p not in rm]
         save_data(self.data)
         self.refresh_list()
+
+    def export_playlist(self, name):
+        paths = self.data["playlists"].get(name, [])
+        if not paths:
+            messagebox.showinfo(APP_NAME, f"'{name}' 플레이리스트가 비어 있습니다.")
+            return
+        initial = self.data.get("export_dir") or self.data.get("music_folder") or str(Path.home())
+        target = filedialog.asksaveasfilename(
+            title="M3U로 내보내기", initialdir=initial, initialfile=tf.safe_filename(name) + ".m3u",
+            defaultextension=".m3u",
+            filetypes=[("M3U 재생목록", "*.m3u"), ("M3U8 재생목록 (UTF-8)", "*.m3u8")])
+        if not target:
+            return
+        try:
+            missing = write_m3u(target, [self.by_path.get(p) or {"path": p} for p in paths])
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"저장하지 못했습니다.\n{e}")
+            return
+        self.data["export_dir"] = str(Path(target).parent)
+        save_data(self.data)
+        msg = f"{len(paths)}곡을 내보냈습니다.\n{target}"
+        if missing:
+            msg += f"\n\n지금 폴더에 없는 파일 {missing}개도 경로 그대로 넣었습니다."
+        messagebox.showinfo(APP_NAME, msg)
 
     def delete_playlist(self, name):
         if not messagebox.askyesno(APP_NAME, f"'{name}' 플레이리스트를 삭제할까요?"):
@@ -1812,6 +2087,36 @@ class MusicApp(ctk.CTk):
             self.update_play_icon()
             self.seek.set(0)
             self.time_now.configure(text="0:00")
+
+    def apply_file_changes(self, changes):
+        """태그 정리로 바뀐 파일만 다시 읽어 목록을 갱신한다(라이브러리 전체를 다시 스캔하지 않음).
+        changes: [(이전 경로, 새 경로)]"""
+        t0 = time.monotonic()
+        mapping = {o: n for o, n in changes if o != n}
+        if mapping:
+            self.favorites = {mapping.get(p, p) for p in self.favorites}
+            self.data["favorites"] = sorted(self.favorites)
+            for name, paths in self.data["playlists"].items():
+                self.data["playlists"][name] = [mapping.get(p, p) for p in paths]
+            save_data(self.data)
+        gone = {o for o, _ in changes}
+        fresh = {n: read_track(n) for _, n in changes if os.path.exists(n)}
+        self.tracks = [t for t in self.tracks if t["path"] not in gone and t["path"] not in fresh] + list(fresh.values())
+        self.tracks.sort(key=lambda t: (t["artist"].casefold(), t["album"].casefold(), t["title"].casefold()))
+        self.by_path = {t["path"]: t for t in self.tracks}
+        if self.queue:
+            cur = self.queue[self.queue_index]["path"] if 0 <= self.queue_index < len(self.queue) else None
+            self.queue = [self.by_path[mapping.get(t["path"], t["path"])] for t in self.queue
+                          if mapping.get(t["path"], t["path"]) in self.by_path]
+            new_cur = mapping.get(cur, cur)
+            self.queue_index = next((i for i, t in enumerate(self.queue) if t["path"] == new_cur), 0)
+        if self.current:
+            self.current = self.by_path.get(mapping.get(self.current["path"], self.current["path"]))
+            if self.current:
+                self.update_now_playing()
+        update_scan_cache(fresh.values(), removed=gone - set(fresh))
+        self.refresh_list()
+        ulog(f"list refresh after apply: {len(fresh)} files in {time.monotonic() - t0:.2f}s")
 
     def remap_paths(self, mapping):
         """파일 이름이 바뀐 뒤 즐겨찾기·플레이리스트·대기열 경로를 맞추고 다시 스캔한다."""
